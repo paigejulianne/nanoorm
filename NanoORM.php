@@ -2,10 +2,41 @@
 /**
  * NanoORM - A Lightweight, Full-Featured PHP ORM
  *
+ * A single-file PHP ORM (~3,500 lines) that provides an elegant, expressive
+ * syntax for database operations. Inspired by Laravel's Eloquent but designed
+ * to be lightweight and dependency-free.
+ *
+ * Features:
+ * - Fluent QueryBuilder with chainable methods
+ * - Model relationships: HasOne, HasMany, BelongsTo, BelongsToMany
+ * - Eager loading to prevent N+1 query problems
+ * - Soft deletes and automatic timestamps
+ * - Attribute casting (json, boolean, datetime, etc.)
+ * - Identity map to prevent duplicate model instances
+ * - Schema builder and migration system
+ * - Database-agnostic (MySQL, PostgreSQL, SQLite, SQL Server)
+ * - Query logging for debugging
+ * - Transaction support
+ *
  * @version 1.0.0
  * @author Paige Julianne
  * @license MIT
  * @requires PHP 8.1+, PDO
+ *
+ * @link https://github.com/paigejulianne/nanoorm
+ *
+ * @example Basic Usage
+ * ```php
+ * // Define a model
+ * class User extends Model {
+ *     public const bool TIMESTAMPS = true;
+ *     public const bool SOFT_DELETES = true;
+ * }
+ *
+ * // Create and query
+ * $user = User::create(['name' => 'John', 'email' => 'john@example.com']);
+ * $users = User::where('active', true)->orderBy('name')->get();
+ * ```
  */
 
 declare(strict_types=1);
@@ -27,6 +58,29 @@ use ReflectionClass;
 // NANO ORM - MAIN MODEL CLASS
 // ============================================================================
 
+/**
+ * Abstract base class for all ORM models.
+ *
+ * Extend this class to create database-backed models with automatic
+ * CRUD operations, relationships, and query building capabilities.
+ *
+ * @example
+ * ```php
+ * class User extends Model
+ * {
+ *     public const string TABLE = 'users';
+ *     public const bool TIMESTAMPS = true;
+ *     public const bool SOFT_DELETES = true;
+ *     public const array CASTS = ['settings' => 'json'];
+ *     public const array HIDDEN = ['password'];
+ *
+ *     public function posts(): HasMany
+ *     {
+ *         return $this->hasMany(Post::class);
+ *     }
+ * }
+ * ```
+ */
 abstract class Model
 {
     // ========== MODEL CONFIGURATION (Override in subclasses) ==========
@@ -120,6 +174,11 @@ abstract class Model
 
     // ========== CONSTRUCTOR ==========
 
+    /**
+     * Create a new model instance.
+     *
+     * @param array<string, mixed> $attributes Initial attribute values
+     */
     public function __construct(array $attributes = [])
     {
         $this->fill($attributes);
@@ -128,7 +187,20 @@ abstract class Model
     // ========== STATIC FACTORY METHODS ==========
 
     /**
-     * Create a new model instance and save it
+     * Create a new model instance and persist it to the database.
+     *
+     * @param array<string, mixed> $attributes The attributes to set on the model
+     * @return static The newly created and persisted model instance
+     *
+     * @throws RuntimeException If the insert fails
+     *
+     * @example
+     * ```php
+     * $user = User::create([
+     *     'name' => 'John Doe',
+     *     'email' => 'john@example.com',
+     * ]);
+     * ```
      */
     public static function create(array $attributes): static
     {
@@ -138,7 +210,14 @@ abstract class Model
     }
 
     /**
-     * Hydrate a model from database row
+     * Create a model instance from a database row without saving.
+     *
+     * This method is used internally to create model instances from
+     * query results. It populates the identity map to prevent duplicate
+     * instances of the same database record.
+     *
+     * @param array<string, mixed> $attributes The database row as an associative array
+     * @return static The hydrated model instance
      */
     public static function hydrate(array $attributes): static
     {
@@ -169,7 +248,18 @@ abstract class Model
     // ========== QUERY STARTERS ==========
 
     /**
-     * Start a new query builder
+     * Start a new query builder for this model.
+     *
+     * @return QueryBuilder A new query builder instance
+     *
+     * @example
+     * ```php
+     * $users = User::query()
+     *     ->where('active', true)
+     *     ->orderBy('created_at', 'DESC')
+     *     ->limit(10)
+     *     ->get();
+     * ```
      */
     public static function query(): QueryBuilder
     {
@@ -177,7 +267,21 @@ abstract class Model
     }
 
     /**
-     * Find by primary key
+     * Find a model by its primary key.
+     *
+     * Uses the identity map to return cached instances when available.
+     * Returns null if the model is not found or is soft-deleted.
+     *
+     * @param mixed $id The primary key value
+     * @return static|null The model instance or null if not found
+     *
+     * @example
+     * ```php
+     * $user = User::find(1);
+     * if ($user) {
+     *     echo $user->name;
+     * }
+     * ```
      */
     public static function find(mixed $id): ?static
     {
@@ -195,7 +299,21 @@ abstract class Model
     }
 
     /**
-     * Find by primary key or throw exception
+     * Find a model by its primary key or throw an exception.
+     *
+     * @param mixed $id The primary key value
+     * @return static The model instance
+     *
+     * @throws RuntimeException If the model is not found
+     *
+     * @example
+     * ```php
+     * try {
+     *     $user = User::findOrFail(999);
+     * } catch (RuntimeException $e) {
+     *     echo "User not found!";
+     * }
+     * ```
      */
     public static function findOrFail(mixed $id): static
     {
@@ -207,7 +325,15 @@ abstract class Model
     }
 
     /**
-     * Find multiple by primary keys
+     * Find multiple models by their primary keys.
+     *
+     * @param array<mixed> $ids Array of primary key values
+     * @return array<static> Array of found model instances
+     *
+     * @example
+     * ```php
+     * $users = User::findMany([1, 2, 3]);
+     * ```
      */
     public static function findMany(array $ids): array
     {
@@ -218,7 +344,14 @@ abstract class Model
     }
 
     /**
-     * Get all records
+     * Get all records from the database.
+     *
+     * @return array<static> Array of all model instances
+     *
+     * @example
+     * ```php
+     * $allUsers = User::all();
+     * ```
      */
     public static function all(): array
     {
@@ -226,7 +359,14 @@ abstract class Model
     }
 
     /**
-     * Count all records
+     * Count all records in the table.
+     *
+     * @return int The total number of records
+     *
+     * @example
+     * ```php
+     * $totalUsers = User::count();
+     * ```
      */
     public static function count(): int
     {
@@ -234,7 +374,24 @@ abstract class Model
     }
 
     /**
-     * Start a where query
+     * Start a query with a WHERE clause.
+     *
+     * @param string|array<string, mixed>|\Closure $column Column name, array of conditions, or closure for nested conditions
+     * @param mixed $operator Comparison operator or value (if operator is omitted)
+     * @param mixed $value The value to compare against
+     * @return QueryBuilder A query builder with the WHERE clause applied
+     *
+     * @example
+     * ```php
+     * // Simple equality
+     * $users = User::where('active', true)->get();
+     *
+     * // With operator
+     * $users = User::where('age', '>=', 18)->get();
+     *
+     * // Array of conditions
+     * $users = User::where(['active' => true, 'role' => 'admin'])->get();
+     * ```
      */
     public static function where(string|array|\Closure $column, mixed $operator = null, mixed $value = null): QueryBuilder
     {
@@ -242,7 +399,16 @@ abstract class Model
     }
 
     /**
-     * Start a whereIn query
+     * Start a query with a WHERE IN clause.
+     *
+     * @param string $column The column name
+     * @param array<mixed> $values Array of values to match
+     * @return QueryBuilder A query builder with the WHERE IN clause applied
+     *
+     * @example
+     * ```php
+     * $users = User::whereIn('id', [1, 2, 3])->get();
+     * ```
      */
     public static function whereIn(string $column, array $values): QueryBuilder
     {
@@ -250,7 +416,11 @@ abstract class Model
     }
 
     /**
-     * Start a whereNotIn query
+     * Start a query with a WHERE NOT IN clause.
+     *
+     * @param string $column The column name
+     * @param array<mixed> $values Array of values to exclude
+     * @return QueryBuilder A query builder with the WHERE NOT IN clause applied
      */
     public static function whereNotIn(string $column, array $values): QueryBuilder
     {
@@ -258,7 +428,10 @@ abstract class Model
     }
 
     /**
-     * Start a whereNull query
+     * Start a query with a WHERE NULL clause.
+     *
+     * @param string $column The column name
+     * @return QueryBuilder A query builder with the WHERE NULL clause applied
      */
     public static function whereNull(string $column): QueryBuilder
     {
@@ -266,7 +439,10 @@ abstract class Model
     }
 
     /**
-     * Start a whereNotNull query
+     * Start a query with a WHERE NOT NULL clause.
+     *
+     * @param string $column The column name
+     * @return QueryBuilder A query builder with the WHERE NOT NULL clause applied
      */
     public static function whereNotNull(string $column): QueryBuilder
     {
@@ -274,7 +450,12 @@ abstract class Model
     }
 
     /**
-     * Start a whereBetween query
+     * Start a query with a WHERE BETWEEN clause.
+     *
+     * @param string $column The column name
+     * @param mixed $min The minimum value
+     * @param mixed $max The maximum value
+     * @return QueryBuilder A query builder with the WHERE BETWEEN clause applied
      */
     public static function whereBetween(string $column, mixed $min, mixed $max): QueryBuilder
     {
@@ -282,7 +463,11 @@ abstract class Model
     }
 
     /**
-     * Start an orderBy query
+     * Start a query with an ORDER BY clause.
+     *
+     * @param string $column The column to order by
+     * @param string $direction Sort direction ('ASC' or 'DESC')
+     * @return QueryBuilder A query builder with the ORDER BY clause applied
      */
     public static function orderBy(string $column, string $direction = 'ASC'): QueryBuilder
     {
@@ -290,7 +475,10 @@ abstract class Model
     }
 
     /**
-     * Order by latest (descending)
+     * Order by column descending (most recent first).
+     *
+     * @param string $column The column to order by (default: 'created_at')
+     * @return QueryBuilder A query builder with ORDER BY DESC applied
      */
     public static function latest(string $column = 'created_at'): QueryBuilder
     {
@@ -298,7 +486,10 @@ abstract class Model
     }
 
     /**
-     * Order by oldest (ascending)
+     * Order by column ascending (oldest first).
+     *
+     * @param string $column The column to order by (default: 'created_at')
+     * @return QueryBuilder A query builder with ORDER BY ASC applied
      */
     public static function oldest(string $column = 'created_at'): QueryBuilder
     {
@@ -306,7 +497,20 @@ abstract class Model
     }
 
     /**
-     * Pluck values from column
+     * Get an array of values from a single column.
+     *
+     * @param string $column The column to pluck values from
+     * @param string|null $key Optional column to use as array keys
+     * @return array<mixed> Array of column values
+     *
+     * @example
+     * ```php
+     * // Get all user names
+     * $names = User::pluck('name');
+     *
+     * // Get names keyed by ID
+     * $names = User::pluck('name', 'id');
+     * ```
      */
     public static function pluck(string $column, ?string $key = null): array
     {
@@ -314,7 +518,22 @@ abstract class Model
     }
 
     /**
-     * Eager load relationships
+     * Eager load relationships to prevent N+1 queries.
+     *
+     * @param string|array<string> ...$relations Relationship names to eager load
+     * @return QueryBuilder A query builder with eager loading configured
+     *
+     * @example
+     * ```php
+     * // Load single relationship
+     * $users = User::with('posts')->get();
+     *
+     * // Load multiple relationships
+     * $users = User::with('posts', 'profile')->get();
+     *
+     * // Load nested relationships
+     * $users = User::with('posts.comments')->get();
+     * ```
      */
     public static function with(string|array ...$relations): QueryBuilder
     {
@@ -322,7 +541,19 @@ abstract class Model
     }
 
     /**
-     * Find or create a record
+     * Find a record matching the attributes or create a new one.
+     *
+     * @param array<string, mixed> $search Attributes to search by
+     * @param array<string, mixed> $additional Additional attributes when creating
+     * @return static The found or newly created model
+     *
+     * @example
+     * ```php
+     * $user = User::firstOrCreate(
+     *     ['email' => 'john@example.com'],
+     *     ['name' => 'John Doe']
+     * );
+     * ```
      */
     public static function firstOrCreate(array $search, array $additional = []): static
     {
@@ -336,7 +567,19 @@ abstract class Model
     }
 
     /**
-     * Update or create a record
+     * Update an existing record or create a new one.
+     *
+     * @param array<string, mixed> $search Attributes to search by
+     * @param array<string, mixed> $update Attributes to update or set when creating
+     * @return static The updated or newly created model
+     *
+     * @example
+     * ```php
+     * $user = User::updateOrCreate(
+     *     ['email' => 'john@example.com'],
+     *     ['name' => 'John Doe', 'last_login' => now()]
+     * );
+     * ```
      */
     public static function updateOrCreate(array $search, array $update = []): static
     {
@@ -354,7 +597,21 @@ abstract class Model
     // ========== BULK OPERATIONS ==========
 
     /**
-     * Bulk insert records
+     * Insert multiple records at once.
+     *
+     * This is more efficient than calling create() in a loop
+     * as it uses a single INSERT statement.
+     *
+     * @param array<array<string, mixed>> $records Array of records to insert
+     * @return int Number of affected rows
+     *
+     * @example
+     * ```php
+     * User::insert([
+     *     ['name' => 'John', 'email' => 'john@example.com'],
+     *     ['name' => 'Jane', 'email' => 'jane@example.com'],
+     * ]);
+     * ```
      */
     public static function insert(array $records): int
     {
@@ -386,7 +643,13 @@ abstract class Model
     }
 
     /**
-     * Bulk insert and return inserted IDs
+     * Insert multiple records and return their IDs.
+     *
+     * Unlike insert(), this method returns the auto-generated IDs
+     * but is less efficient as it uses individual INSERT statements.
+     *
+     * @param array<array<string, mixed>> $records Array of records to insert
+     * @return array<mixed> Array of inserted primary key values
      */
     public static function insertGetIds(array $records): array
     {
@@ -852,7 +1115,15 @@ abstract class Model
     // ========== RELATIONSHIPS ==========
 
     /**
-     * Get relationship value (lazy loading)
+     * Get a relationship value, loading it lazily if not already loaded.
+     *
+     * This method is called automatically when accessing a relationship
+     * as a property (e.g., $user->posts).
+     *
+     * @param string $name The relationship method name
+     * @return mixed The related model(s) or null
+     *
+     * @throws RuntimeException If the method does not return a Relation instance
      */
     protected function getRelationValue(string $name): mixed
     {
@@ -873,7 +1144,13 @@ abstract class Model
     }
 
     /**
-     * Set a relationship value
+     * Manually set a relationship value on the model.
+     *
+     * This is primarily used internally during eager loading.
+     *
+     * @param string $name The relationship name
+     * @param mixed $value The related model(s)
+     * @return static
      */
     public function setRelation(string $name, mixed $value): static
     {
@@ -882,7 +1159,16 @@ abstract class Model
     }
 
     /**
-     * Load relationships onto the model
+     * Lazy load relationships on an existing model.
+     *
+     * @param string|array<string> ...$relations Relationship names to load
+     * @return static
+     *
+     * @example
+     * ```php
+     * $user = User::find(1);
+     * $user->load('posts', 'profile');
+     * ```
      */
     public function load(string|array ...$relations): static
     {
@@ -896,7 +1182,23 @@ abstract class Model
     }
 
     /**
-     * Define a HasOne relationship
+     * Define a one-to-one relationship.
+     *
+     * Use this when the related model has a foreign key pointing to this model.
+     *
+     * @param string $related The related model class name
+     * @param string|null $foreignKey The foreign key on the related model (default: {table}_id)
+     * @param string|null $localKey The local key on this model (default: primary key)
+     * @return HasOne The relationship instance
+     *
+     * @example
+     * ```php
+     * // In User model
+     * public function profile(): HasOne
+     * {
+     *     return $this->hasOne(Profile::class);
+     * }
+     * ```
      */
     protected function hasOne(string $related, ?string $foreignKey = null, ?string $localKey = null): HasOne
     {
@@ -907,7 +1209,23 @@ abstract class Model
     }
 
     /**
-     * Define a HasMany relationship
+     * Define a one-to-many relationship.
+     *
+     * Use this when multiple related models have foreign keys pointing to this model.
+     *
+     * @param string $related The related model class name
+     * @param string|null $foreignKey The foreign key on the related model (default: {table}_id)
+     * @param string|null $localKey The local key on this model (default: primary key)
+     * @return HasMany The relationship instance
+     *
+     * @example
+     * ```php
+     * // In User model
+     * public function posts(): HasMany
+     * {
+     *     return $this->hasMany(Post::class);
+     * }
+     * ```
      */
     protected function hasMany(string $related, ?string $foreignKey = null, ?string $localKey = null): HasMany
     {
@@ -918,7 +1236,23 @@ abstract class Model
     }
 
     /**
-     * Define a BelongsTo relationship
+     * Define an inverse one-to-one or one-to-many relationship.
+     *
+     * Use this when this model has a foreign key pointing to the related model.
+     *
+     * @param string $related The related model class name
+     * @param string|null $foreignKey The foreign key on this model (default: {related_table}_id)
+     * @param string|null $ownerKey The key on the related model (default: primary key)
+     * @return BelongsTo The relationship instance
+     *
+     * @example
+     * ```php
+     * // In Post model
+     * public function author(): BelongsTo
+     * {
+     *     return $this->belongsTo(User::class, 'user_id');
+     * }
+     * ```
      */
     protected function belongsTo(string $related, ?string $foreignKey = null, ?string $ownerKey = null): BelongsTo
     {
@@ -929,7 +1263,24 @@ abstract class Model
     }
 
     /**
-     * Define a BelongsToMany relationship
+     * Define a many-to-many relationship.
+     *
+     * This requires a pivot table containing foreign keys to both models.
+     *
+     * @param string $related The related model class name
+     * @param string|null $pivotTable The pivot table name (default: alphabetically sorted singular table names joined with _)
+     * @param string|null $foreignPivotKey This model's foreign key in the pivot table
+     * @param string|null $relatedPivotKey Related model's foreign key in the pivot table
+     * @return BelongsToMany The relationship instance
+     *
+     * @example
+     * ```php
+     * // In Post model (pivot table: post_tag)
+     * public function tags(): BelongsToMany
+     * {
+     *     return $this->belongsToMany(Tag::class);
+     * }
+     * ```
      */
     protected function belongsToMany(
         string $related,
@@ -950,7 +1301,9 @@ abstract class Model
     }
 
     /**
-     * Get foreign key name for this model
+     * Get the default foreign key name for this model.
+     *
+     * @return string The foreign key name (e.g., 'user_id' for the 'users' table)
      */
     public function getForeignKey(): string
     {
@@ -959,7 +1312,10 @@ abstract class Model
     }
 
     /**
-     * Guess foreign key for belongsTo
+     * Guess the foreign key for a belongsTo relationship.
+     *
+     * @param string $related The related model class name
+     * @return string The guessed foreign key name
      */
     protected function guessBelongsToForeignKey(string $related): string
     {
@@ -1004,49 +1360,63 @@ abstract class Model
 
     // ========== SERIALIZATION ==========
 
+    /** @var array Track models being serialized to prevent infinite loops */
+    private static array $serializingModels = [];
+
     /**
      * Convert model to array
      */
     public function toArray(): array
     {
-        $attributes = $this->attributes;
+        // Prevent infinite recursion from circular references
+        $objectId = spl_object_id($this);
+        if (isset(self::$serializingModels[$objectId])) {
+            return ['id' => $this->getKey()]; // Return minimal reference
+        }
+        self::$serializingModels[$objectId] = true;
 
-        // Apply casts
-        foreach (static::CASTS as $key => $cast) {
-            if (isset($attributes[$key])) {
-                $attributes[$key] = $this->castAttribute($key, $attributes[$key]);
+        try {
+            $attributes = $this->attributes;
+
+            // Apply casts
+            foreach (static::CASTS as $key => $cast) {
+                if (isset($attributes[$key])) {
+                    $attributes[$key] = $this->castAttribute($key, $attributes[$key]);
+                }
             }
-        }
 
-        // Handle datetime objects
-        foreach ($attributes as $key => $value) {
-            if ($value instanceof DateTimeInterface) {
-                $attributes[$key] = $value->format('Y-m-d H:i:s');
+            // Handle datetime objects
+            foreach ($attributes as $key => $value) {
+                if ($value instanceof DateTimeInterface) {
+                    $attributes[$key] = $value->format('Y-m-d H:i:s');
+                }
             }
-        }
 
-        // Apply hidden
-        if (!empty(static::HIDDEN)) {
-            $attributes = array_diff_key($attributes, array_flip(static::HIDDEN));
-        }
-
-        // Apply visible
-        if (!empty(static::VISIBLE)) {
-            $attributes = array_intersect_key($attributes, array_flip(static::VISIBLE));
-        }
-
-        // Add loaded relations
-        foreach ($this->relations as $key => $relation) {
-            if (is_array($relation)) {
-                $attributes[$key] = array_map(fn($m) => $m->toArray(), $relation);
-            } elseif ($relation instanceof self) {
-                $attributes[$key] = $relation->toArray();
-            } else {
-                $attributes[$key] = $relation;
+            // Apply hidden
+            if (!empty(static::HIDDEN)) {
+                $attributes = array_diff_key($attributes, array_flip(static::HIDDEN));
             }
-        }
 
-        return $attributes;
+            // Apply visible
+            if (!empty(static::VISIBLE)) {
+                $attributes = array_intersect_key($attributes, array_flip(static::VISIBLE));
+            }
+
+            // Add loaded relations
+            foreach ($this->relations as $key => $relation) {
+                if (is_array($relation)) {
+                    $attributes[$key] = array_map(fn($m) => $m->toArray(), $relation);
+                } elseif ($relation instanceof self) {
+                    $attributes[$key] = $relation->toArray();
+                } else {
+                    $attributes[$key] = $relation;
+                }
+            }
+
+            return $attributes;
+        } finally {
+            unset(self::$serializingModels[$objectId]);
+        }
     }
 
     /**
@@ -1312,7 +1682,21 @@ abstract class Model
     // ========== TRANSACTIONS ==========
 
     /**
-     * Begin a transaction
+     * Begin a database transaction.
+     *
+     * @return bool True on success
+     *
+     * @example
+     * ```php
+     * Model::beginTransaction();
+     * try {
+     *     User::create(['name' => 'John']);
+     *     Profile::create(['user_id' => 1]);
+     *     Model::commit();
+     * } catch (Exception $e) {
+     *     Model::rollback();
+     * }
+     * ```
      */
     public static function beginTransaction(): bool
     {
@@ -1320,7 +1704,9 @@ abstract class Model
     }
 
     /**
-     * Commit a transaction
+     * Commit the current database transaction.
+     *
+     * @return bool True on success
      */
     public static function commit(): bool
     {
@@ -1328,7 +1714,9 @@ abstract class Model
     }
 
     /**
-     * Rollback a transaction
+     * Rollback the current database transaction.
+     *
+     * @return bool True on success
      */
     public static function rollback(): bool
     {
@@ -1336,7 +1724,24 @@ abstract class Model
     }
 
     /**
-     * Execute callback in a transaction
+     * Execute a callback within a database transaction.
+     *
+     * If the callback throws an exception, the transaction is automatically
+     * rolled back. Otherwise, it is committed.
+     *
+     * @param callable $callback The callback to execute (receives PDO instance)
+     * @return mixed The return value of the callback
+     *
+     * @throws Throwable Re-throws any exception from the callback after rollback
+     *
+     * @example
+     * ```php
+     * Model::transaction(function ($pdo) {
+     *     $user = User::create(['name' => 'John']);
+     *     Profile::create(['user_id' => $user->id]);
+     *     return $user;
+     * });
+     * ```
      */
     public static function transaction(callable $callback): mixed
     {
@@ -1412,20 +1817,75 @@ abstract class Model
 // QUERY BUILDER
 // ============================================================================
 
+/**
+ * Fluent query builder for constructing and executing database queries.
+ *
+ * The QueryBuilder provides a chainable API for building SELECT, UPDATE, and
+ * DELETE queries with support for WHERE clauses, ordering, pagination, and
+ * eager loading of relationships.
+ *
+ * Typically you don't instantiate this class directly - use Model::query()
+ * or the static query methods on your model classes.
+ *
+ * @example
+ * ```php
+ * // Complex query with multiple conditions
+ * $posts = Post::query()
+ *     ->where('is_published', true)
+ *     ->where('created_at', '>', '2024-01-01')
+ *     ->whereIn('category_id', [1, 2, 3])
+ *     ->with('author', 'comments')
+ *     ->orderBy('created_at', 'DESC')
+ *     ->limit(10)
+ *     ->get();
+ *
+ * // Pagination
+ * $page = User::query()
+ *     ->where('active', true)
+ *     ->orderBy('name')
+ *     ->paginate(perPage: 15, page: 1);
+ * ```
+ */
 class QueryBuilder
 {
+    /** @var string The model class being queried */
     private string $model;
+
+    /** @var array<array> WHERE clause definitions */
     private array $wheres = [];
+
+    /** @var array<array> ORDER BY clause definitions */
     private array $orderBys = [];
+
+    /** @var int|null LIMIT value */
     private ?int $limitValue = null;
+
+    /** @var int|null OFFSET value */
     private ?int $offsetValue = null;
+
+    /** @var array<string> Columns to SELECT */
     private array $columns = ['*'];
+
+    /** @var array<string> GROUP BY columns */
     private array $groupBy = [];
+
+    /** @var array<array> HAVING clause definitions */
     private array $having = [];
+
+    /** @var bool Include soft-deleted records */
     private bool $withTrashed = false;
+
+    /** @var bool Only return soft-deleted records */
     private bool $onlyTrashed = false;
+
+    /** @var array<string> Relationships to eager load */
     private array $eagerLoad = [];
 
+    /**
+     * Create a new query builder for the given model.
+     *
+     * @param string $model The fully-qualified model class name
+     */
     public function __construct(string $model)
     {
         $this->model = $model;
@@ -2251,16 +2711,44 @@ class QueryBuilder
 // ============================================================================
 
 /**
- * Base Relation class
+ * Abstract base class for all relationship types.
+ *
+ * Relationships define how models are connected to each other.
+ * NanoORM supports four relationship types:
+ * - HasOne: One-to-one (parent has one child)
+ * - HasMany: One-to-many (parent has many children)
+ * - BelongsTo: Inverse of HasOne/HasMany
+ * - BelongsToMany: Many-to-many via pivot table
+ *
+ * Relationships can be accessed as properties on models, which triggers
+ * lazy loading. For better performance with multiple models, use
+ * eager loading via Model::with().
  */
 abstract class Relation
 {
+    /** @var Model The parent model instance */
     protected Model $parent;
+
+    /** @var string The related model class name */
     protected string $related;
+
+    /** @var string The foreign key column */
     protected string $foreignKey;
+
+    /** @var string The local key column */
     protected string $localKey;
+
+    /** @var array<mixed> Keys for eager loading */
     protected array $eagerKeys = [];
 
+    /**
+     * Create a new relationship instance.
+     *
+     * @param Model $parent The parent model
+     * @param string $related The related model class name
+     * @param string $foreignKey The foreign key column
+     * @param string $localKey The local key column
+     */
     public function __construct(Model $parent, string $related, string $foreignKey, string $localKey)
     {
         $this->parent = $parent;
@@ -2270,27 +2758,39 @@ abstract class Relation
     }
 
     /**
-     * Get the results of the relationship
+     * Get the results of the relationship (lazy loading).
+     *
+     * @return mixed The related model(s) or null
      */
     abstract public function getResults(): mixed;
 
     /**
-     * Add constraints for eager loading
+     * Add constraints for eager loading.
+     *
+     * @param array<Model> $models Parent models to eager load for
      */
     abstract public function addEagerConstraints(array $models): void;
 
     /**
-     * Get results for eager loading
+     * Get results for eager loading.
+     *
+     * @return array<Model> Array of related models
      */
     abstract public function getEagerResults(): array;
 
     /**
-     * Match eager loaded results to their parent models
+     * Match eager loaded results to their parent models.
+     *
+     * @param array<Model> $models Parent models
+     * @param array<Model> $results Related models
+     * @param string $relation The relationship name
      */
     abstract public function match(array $models, array $results, string $relation): void;
 
     /**
-     * Get a new query builder for the related model
+     * Get a new query builder for the related model.
+     *
+     * @return QueryBuilder A new query builder
      */
     protected function newQuery(): QueryBuilder
     {
@@ -2298,7 +2798,13 @@ abstract class Relation
     }
 
     /**
-     * Forward method calls to query builder
+     * Forward method calls to the query builder.
+     *
+     * Allows using query builder methods directly on relationships.
+     *
+     * @param string $method The method name
+     * @param array<mixed> $args The method arguments
+     * @return mixed The result of the query builder method
      */
     public function __call(string $method, array $args): mixed
     {
@@ -2308,7 +2814,22 @@ abstract class Relation
 }
 
 /**
- * HasOne relationship
+ * One-to-one relationship where the related model has the foreign key.
+ *
+ * Example: User hasOne Profile (profiles table has user_id)
+ *
+ * @example
+ * ```php
+ * // In User model
+ * public function profile(): HasOne
+ * {
+ *     return $this->hasOne(Profile::class);
+ * }
+ *
+ * // Usage
+ * $user = User::find(1);
+ * echo $user->profile->bio;
+ * ```
  */
 class HasOne extends Relation
 {
@@ -2352,7 +2873,24 @@ class HasOne extends Relation
 }
 
 /**
- * HasMany relationship
+ * One-to-many relationship where related models have the foreign key.
+ *
+ * Example: User hasMany Posts (posts table has user_id)
+ *
+ * @example
+ * ```php
+ * // In User model
+ * public function posts(): HasMany
+ * {
+ *     return $this->hasMany(Post::class);
+ * }
+ *
+ * // Usage
+ * $user = User::find(1);
+ * foreach ($user->posts as $post) {
+ *     echo $post->title;
+ * }
+ * ```
  */
 class HasMany extends Relation
 {
@@ -2396,7 +2934,24 @@ class HasMany extends Relation
 }
 
 /**
- * BelongsTo relationship
+ * Inverse one-to-one or one-to-many relationship.
+ *
+ * Use BelongsTo when this model has the foreign key pointing to another model.
+ *
+ * Example: Post belongsTo User (posts table has user_id)
+ *
+ * @example
+ * ```php
+ * // In Post model
+ * public function author(): BelongsTo
+ * {
+ *     return $this->belongsTo(User::class, 'user_id');
+ * }
+ *
+ * // Usage
+ * $post = Post::find(1);
+ * echo $post->author->name;
+ * ```
  */
 class BelongsTo extends Relation
 {
@@ -2465,13 +3020,46 @@ class BelongsTo extends Relation
 }
 
 /**
- * BelongsToMany relationship (Many-to-Many)
+ * Many-to-many relationship via a pivot table.
+ *
+ * BelongsToMany requires an intermediate (pivot) table with foreign keys
+ * to both models. The pivot table name defaults to the alphabetically
+ * sorted singular table names joined with underscore (e.g., post_tag).
+ *
+ * Example: Post belongsToMany Tags (via post_tag pivot table)
+ *
+ * @example
+ * ```php
+ * // In Post model
+ * public function tags(): BelongsToMany
+ * {
+ *     return $this->belongsToMany(Tag::class);
+ * }
+ *
+ * // Usage
+ * $post = Post::find(1);
+ * foreach ($post->tags as $tag) {
+ *     echo $tag->name;
+ * }
+ *
+ * // Attaching/detaching
+ * $post->tags()->attach([1, 2, 3]);
+ * $post->tags()->detach(1);
+ * $post->tags()->sync([2, 3, 4]); // Removes 1, keeps 2,3, adds 4
+ * ```
  */
 class BelongsToMany extends Relation
 {
+    /** @var string The pivot table name */
     private string $pivotTable;
+
+    /** @var string This model's foreign key in the pivot table */
     private string $foreignPivotKey;
+
+    /** @var string Related model's foreign key in the pivot table */
     private string $relatedPivotKey;
+
+    /** @var array<string> Additional pivot columns to retrieve */
     private array $pivotColumns = [];
 
     public function __construct(
@@ -2686,12 +3274,50 @@ class BelongsToMany extends Relation
 // ============================================================================
 
 /**
- * Simple migration runner
+ * Database migration runner.
+ *
+ * The Migrator handles running and rolling back database migrations.
+ * Migration files should be PHP files that return an array with 'up' and 'down' keys.
+ *
+ * @example
+ * ```php
+ * // Run migrations
+ * $migrator = new Migrator($pdo, __DIR__ . '/migrations');
+ * $ran = $migrator->migrate();
+ *
+ * // Rollback last batch
+ * $rolledBack = $migrator->rollback();
+ *
+ * // Reset and re-run all
+ * $migrator->refresh();
+ * ```
+ *
+ * @example Migration file format (migrations/001_create_users_table.php)
+ * ```php
+ * <?php
+ * use NanoORM\Schema;
+ * use NanoORM\Blueprint;
+ *
+ * return [
+ *     'up' => Schema::create('users', function (Blueprint $table) {
+ *         $table->id();
+ *         $table->string('name');
+ *         $table->string('email')->unique();
+ *         $table->timestamps();
+ *     }),
+ *     'down' => Schema::drop('users'),
+ * ];
+ * ```
  */
 class Migrator
 {
+    /** @var PDO Database connection */
     private PDO $pdo;
+
+    /** @var string Migrations tracking table name */
     private string $table;
+
+    /** @var string Path to migration files */
     private string $path;
 
     public function __construct(PDO $pdo, string $migrationsPath, string $table = 'migrations')
@@ -2895,14 +3521,37 @@ class Migrator
 }
 
 /**
- * Schema builder helper
+ * Schema builder for creating and modifying database tables.
+ *
+ * Provides a fluent interface for defining database schemas that
+ * works across MySQL, PostgreSQL, and SQLite.
+ *
+ * @example
+ * ```php
+ * // Create a table
+ * $sql = Schema::create('users', function (Blueprint $table) {
+ *     $table->id();
+ *     $table->string('name');
+ *     $table->string('email')->unique();
+ *     $table->text('bio')->nullable();
+ *     $table->boolean('active')->default(true);
+ *     $table->timestamps();
+ *     $table->softDeletes();
+ * });
+ *
+ * // Drop a table
+ * $sql = Schema::drop('users');
+ * ```
  */
 class Schema
 {
+    /** @var PDO|null Database connection for schema operations */
     private static ?PDO $connection = null;
 
     /**
-     * Set the connection for schema operations
+     * Set the database connection for schema operations.
+     *
+     * @param PDO $pdo The PDO connection
      */
     public static function connection(PDO $pdo): void
     {
@@ -2910,7 +3559,11 @@ class Schema
     }
 
     /**
-     * Create a table
+     * Create a new database table.
+     *
+     * @param string $table The table name
+     * @param callable $callback Callback that receives a Blueprint instance
+     * @return string The CREATE TABLE SQL statement
      */
     public static function create(string $table, callable $callback): string
     {
@@ -2920,7 +3573,11 @@ class Schema
     }
 
     /**
-     * Modify a table
+     * Modify an existing database table.
+     *
+     * @param string $table The table name
+     * @param callable $callback Callback that receives a Blueprint instance
+     * @return array<string> Array of ALTER TABLE SQL statements
      */
     public static function table(string $table, callable $callback): array
     {
@@ -2931,7 +3588,10 @@ class Schema
     }
 
     /**
-     * Drop a table
+     * Drop a database table.
+     *
+     * @param string $table The table name
+     * @return string The DROP TABLE SQL statement
      */
     public static function drop(string $table): string
     {
@@ -2939,7 +3599,11 @@ class Schema
     }
 
     /**
-     * Rename a table
+     * Rename a database table.
+     *
+     * @param string $from The current table name
+     * @param string $to The new table name
+     * @return string The ALTER TABLE RENAME SQL statement
      */
     public static function rename(string $from, string $to): string
     {
@@ -2947,7 +3611,12 @@ class Schema
     }
 
     /**
-     * Check if table exists
+     * Check if a table exists in the database.
+     *
+     * @param string $table The table name
+     * @return bool True if the table exists
+     *
+     * @throws RuntimeException If no database connection is set
      */
     public static function hasTable(string $table): bool
     {
@@ -2970,25 +3639,70 @@ class Schema
 }
 
 /**
- * Table blueprint for schema building
+ * Table blueprint for defining database table structure.
+ *
+ * Blueprint provides methods for defining columns, indexes, and
+ * foreign keys in a fluent, chainable API. Column modifiers like
+ * nullable(), default(), and unique() apply to the last defined column.
+ *
+ * @example
+ * ```php
+ * Schema::create('posts', function (Blueprint $table) {
+ *     $table->id();
+ *     $table->unsignedBigInteger('user_id');
+ *     $table->string('title');
+ *     $table->text('body');
+ *     $table->boolean('is_published')->default(false);
+ *     $table->json('metadata')->nullable();
+ *     $table->timestamps();
+ *     $table->softDeletes();
+ *     $table->foreign('user_id')->references('id')->on('users')->cascadeOnDelete();
+ * });
+ * ```
  */
 class Blueprint
 {
+    /** @var string The table name */
     private string $table;
+
+    /** @var PDO|null Database connection for type mapping */
     private ?PDO $connection;
+
+    /** @var array<string, array> Column definitions */
     private array $columns = [];
+
+    /** @var array<array> Index definitions */
     private array $indexes = [];
+
+    /** @var array<ForeignKeyDefinition> Foreign key definitions */
     private array $foreignKeys = [];
+
+    /** @var string|null Primary key column */
     private ?string $primaryKey = null;
+
+    /** @var bool Whether we're modifying an existing table */
     private bool $modifying = false;
+
+    /** @var string|null The last defined column (for modifiers) */
     private ?string $lastColumn = null;
 
+    /**
+     * Create a new Blueprint instance.
+     *
+     * @param string $table The table name
+     * @param PDO|null $connection Optional PDO connection for database-specific type mapping
+     */
     public function __construct(string $table, ?PDO $connection = null)
     {
         $this->table = $table;
         $this->connection = $connection;
     }
 
+    /**
+     * Set whether this blueprint is modifying an existing table.
+     *
+     * @param bool $modifying True if modifying an existing table
+     */
     public function setModifying(bool $modifying): void
     {
         $this->modifying = $modifying;
@@ -3524,60 +4238,139 @@ class Blueprint
 }
 
 /**
- * Foreign key definition builder
+ * Fluent builder for defining foreign key constraints.
+ *
+ * Used within a Blueprint to define foreign key relationships
+ * between tables.
+ *
+ * @example
+ * ```php
+ * // Basic foreign key
+ * $table->foreign('user_id')->references('id')->on('users');
+ *
+ * // With cascade delete
+ * $table->foreign('user_id')
+ *     ->references('id')
+ *     ->on('users')
+ *     ->cascadeOnDelete();
+ *
+ * // Set null on delete
+ * $table->foreign('category_id')
+ *     ->references('id')
+ *     ->on('categories')
+ *     ->nullOnDelete();
+ * ```
  */
 class ForeignKeyDefinition
 {
+    /** @var string The column that holds the foreign key */
     private string $column;
+
+    /** @var string|null The referenced column in the foreign table */
     private ?string $referencedColumn = null;
+
+    /** @var string|null The foreign table name */
     private ?string $referencedTable = null;
+
+    /** @var string Action on delete (RESTRICT, CASCADE, SET NULL, NO ACTION) */
     private string $onDelete = 'RESTRICT';
+
+    /** @var string Action on update (RESTRICT, CASCADE, SET NULL, NO ACTION) */
     private string $onUpdate = 'RESTRICT';
 
+    /**
+     * Create a new foreign key definition.
+     *
+     * @param string $column The column that holds the foreign key
+     */
     public function __construct(string $column)
     {
         $this->column = $column;
     }
 
+    /**
+     * Set the referenced column in the foreign table.
+     *
+     * @param string $column The referenced column name
+     * @return static
+     */
     public function references(string $column): static
     {
         $this->referencedColumn = $column;
         return $this;
     }
 
+    /**
+     * Set the foreign table name.
+     *
+     * @param string $table The table name
+     * @return static
+     */
     public function on(string $table): static
     {
         $this->referencedTable = $table;
         return $this;
     }
 
+    /**
+     * Set the ON DELETE action.
+     *
+     * @param string $action The action (RESTRICT, CASCADE, SET NULL, NO ACTION)
+     * @return static
+     */
     public function onDelete(string $action): static
     {
         $this->onDelete = strtoupper($action);
         return $this;
     }
 
+    /**
+     * Set the ON UPDATE action.
+     *
+     * @param string $action The action (RESTRICT, CASCADE, SET NULL, NO ACTION)
+     * @return static
+     */
     public function onUpdate(string $action): static
     {
         $this->onUpdate = strtoupper($action);
         return $this;
     }
 
+    /**
+     * Set ON DELETE CASCADE - deletes child rows when parent is deleted.
+     *
+     * @return static
+     */
     public function cascadeOnDelete(): static
     {
         return $this->onDelete('CASCADE');
     }
 
+    /**
+     * Set ON UPDATE CASCADE - updates child rows when parent key changes.
+     *
+     * @return static
+     */
     public function cascadeOnUpdate(): static
     {
         return $this->onUpdate('CASCADE');
     }
 
+    /**
+     * Set ON DELETE SET NULL - sets child foreign key to NULL when parent is deleted.
+     *
+     * @return static
+     */
     public function nullOnDelete(): static
     {
         return $this->onDelete('SET NULL');
     }
 
+    /**
+     * Generate the SQL for this foreign key constraint.
+     *
+     * @return string The FOREIGN KEY SQL clause
+     */
     public function toSql(): string
     {
         return "FOREIGN KEY (" . Model::quoteIdentifier($this->column) . ") "
