@@ -1,0 +1,17 @@
+# NanoORM Database Connections
+# Copy this file to .connections and update with your credentials
+# IMPORTANT: Never commit .connections to version control!
+
+[default]
+DSN=mysql:host=localhost;dbname=myapp;charset=utf8mb4
+USER=root
+PASS=secret
+OPTIONS[PDO::ATTR_PERSISTENT]=true
+
+[testing]
+DSN=sqlite::memory:
+
+[analytics]
+DSN=pgsql:host=analytics.example.com;dbname=analytics
+USER=analytics_user
+PASS=analytics_pass
