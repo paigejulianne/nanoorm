@@ -69,7 +69,7 @@ class CrudTest extends NanoORMTestCase
         $users = User::findMany([$user1->getKey(), $user3->getKey()]);
 
         $this->assertCount(2, $users);
-        $names = array_map(fn($u) => $u->name, $users);
+        $names = $users->pluck('name')->toArray();
         $this->assertContains('User 1', $names);
         $this->assertContains('User 3', $names);
     }

@@ -121,6 +121,12 @@ abstract class Model
     /** @var array<string> Only these attributes in array/JSON (if set) */
     public const array VISIBLE = [];
 
+    /** @var array<string> Attributes that are mass assignable (whitelist) */
+    public const array FILLABLE = [];
+
+    /** @var array<string> Attributes that are NOT mass assignable (blacklist) */
+    public const array GUARDED = ['*'];
+
     // ========== INSTANCE STATE ==========
 
     /** @var array<string, mixed> Current attribute values */
@@ -207,6 +213,144 @@ abstract class Model
         $model = new static($attributes);
         $model->save();
         return $model;
+    }
+
+    /**
+     * Insert or update records in bulk (upsert).
+     *
+     * Inserts new records or updates existing ones based on unique key conflicts.
+     * Useful for batch operations where you want to create or update many records
+     * in a single query.
+     *
+     * @param array<array<string, mixed>> $values Array of records to upsert
+     * @param array<string>|string $uniqueBy Column(s) to check for conflicts
+     * @param array<string>|null $update Columns to update on conflict (null = all)
+     * @return int Number of affected rows
+     *
+     * @example
+     * ```php
+     * // Upsert products by SKU
+     * Product::upsert(
+     *     [
+     *         ['sku' => 'ABC123', 'name' => 'Widget', 'price' => 9.99],
+     *         ['sku' => 'DEF456', 'name' => 'Gadget', 'price' => 19.99],
+     *     ],
+     *     ['sku'],           // Unique column
+     *     ['name', 'price']  // Columns to update on conflict
+     * );
+     * ```
+     */
+    public static function upsert(array $values, array|string $uniqueBy, ?array $update = null): int
+    {
+        if (empty($values)) {
+            return 0;
+        }
+
+        $uniqueBy = (array) $uniqueBy;
+        $values = array_values($values);
+        $first = $values[0];
+        $columns = array_keys($first);
+
+        // Columns to update (default: all except unique keys)
+        if ($update === null) {
+            $update = array_diff($columns, $uniqueBy);
+        }
+
+        $pdo = static::getConnection();
+        $driver = $pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        $table = static::quoteIdentifier(static::getTable());
+
+        // Build column list
+        $columnsSql = implode(', ', array_map(fn($c) => static::quoteIdentifier($c), $columns));
+
+        // Build placeholders for all values
+        $placeholderRow = '(' . implode(', ', array_fill(0, count($columns), '?')) . ')';
+        $placeholders = implode(', ', array_fill(0, count($values), $placeholderRow));
+
+        // Flatten values for binding
+        $bindings = [];
+        foreach ($values as $row) {
+            foreach ($columns as $col) {
+                $bindings[] = $row[$col] ?? null;
+            }
+        }
+
+        // Build driver-specific SQL
+        $sql = "INSERT INTO $table ($columnsSql) VALUES $placeholders";
+
+        if ($driver === 'mysql') {
+            // MySQL: ON DUPLICATE KEY UPDATE
+            $updates = [];
+            foreach ($update as $col) {
+                $quoted = static::quoteIdentifier($col);
+                $updates[] = "$quoted = VALUES($quoted)";
+            }
+            $sql .= ' ON DUPLICATE KEY UPDATE ' . implode(', ', $updates);
+        } else {
+            // SQLite/PostgreSQL: ON CONFLICT DO UPDATE
+            $conflictCols = implode(', ', array_map(fn($c) => static::quoteIdentifier($c), $uniqueBy));
+            $updates = [];
+            foreach ($update as $col) {
+                $quoted = static::quoteIdentifier($col);
+                $updates[] = "$quoted = EXCLUDED.$quoted";
+            }
+            if (!empty($updates)) {
+                $sql .= " ON CONFLICT ($conflictCols) DO UPDATE SET " . implode(', ', $updates);
+            } else {
+                $sql .= " ON CONFLICT ($conflictCols) DO NOTHING";
+            }
+        }
+
+        return static::executeStatement($sql, $bindings);
+    }
+
+    /**
+     * Insert records, ignoring any that would cause conflicts.
+     *
+     * @param array<array<string, mixed>> $values Records to insert
+     * @return int Number of inserted rows
+     *
+     * @example
+     * ```php
+     * User::insertOrIgnore([
+     *     ['email' => 'user1@example.com', 'name' => 'User 1'],
+     *     ['email' => 'user2@example.com', 'name' => 'User 2'],
+     * ]);
+     * ```
+     */
+    public static function insertOrIgnore(array $values): int
+    {
+        if (empty($values)) {
+            return 0;
+        }
+
+        $values = array_values($values);
+        $first = $values[0];
+        $columns = array_keys($first);
+
+        $pdo = static::getConnection();
+        $driver = $pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        $table = static::quoteIdentifier(static::getTable());
+
+        $columnsSql = implode(', ', array_map(fn($c) => static::quoteIdentifier($c), $columns));
+        $placeholderRow = '(' . implode(', ', array_fill(0, count($columns), '?')) . ')';
+        $placeholders = implode(', ', array_fill(0, count($values), $placeholderRow));
+
+        $bindings = [];
+        foreach ($values as $row) {
+            foreach ($columns as $col) {
+                $bindings[] = $row[$col] ?? null;
+            }
+        }
+
+        if ($driver === 'mysql') {
+            $sql = "INSERT IGNORE INTO $table ($columnsSql) VALUES $placeholders";
+        } else {
+            // SQLite/PostgreSQL
+            $sql = "INSERT INTO $table ($columnsSql) VALUES $placeholders ON CONFLICT DO NOTHING";
+        }
+
+        return static::executeStatement($sql, $bindings);
     }
 
     /**
@@ -335,10 +479,10 @@ abstract class Model
      * $users = User::findMany([1, 2, 3]);
      * ```
      */
-    public static function findMany(array $ids): array
+    public static function findMany(array $ids): Collection
     {
         if (empty($ids)) {
-            return [];
+            return new Collection([]);
         }
         return static::query()->whereIn(static::PRIMARY_KEY, $ids)->get();
     }
@@ -346,14 +490,14 @@ abstract class Model
     /**
      * Get all records from the database.
      *
-     * @return array<static> Array of all model instances
+     * @return Collection<static> Collection of all model instances
      *
      * @example
      * ```php
      * $allUsers = User::all();
      * ```
      */
-    public static function all(): array
+    public static function all(): Collection
     {
         return static::query()->get();
     }
@@ -717,11 +861,23 @@ abstract class Model
     }
 
     /**
-     * Get attribute with casting
+     * Get attribute with accessor and casting support.
+     *
+     * Checks for accessor method (get{AttributeName}Attribute) first,
+     * then applies casting if defined.
+     *
+     * @param string $key Attribute name
+     * @return mixed Attribute value
      */
     public function getAttribute(string $key): mixed
     {
         $value = $this->attributes[$key] ?? null;
+
+        // Check for accessor method (e.g., getFullNameAttribute for 'full_name')
+        $accessor = 'get' . str_replace('_', '', ucwords($key, '_')) . 'Attribute';
+        if (method_exists($this, $accessor)) {
+            return $this->$accessor($value);
+        }
 
         // Apply cast if defined
         if (isset(static::CASTS[$key]) && $value !== null) {
@@ -732,10 +888,23 @@ abstract class Model
     }
 
     /**
-     * Set attribute with reverse casting
+     * Set attribute with mutator and reverse casting support.
+     *
+     * Checks for mutator method (set{AttributeName}Attribute) first,
+     * then applies reverse casting if defined.
+     *
+     * @param string $key Attribute name
+     * @param mixed $value Value to set
+     * @return static
      */
     public function setAttribute(string $key, mixed $value): static
     {
+        // Check for mutator method (e.g., setPasswordAttribute for 'password')
+        $mutator = 'set' . str_replace('_', '', ucwords($key, '_')) . 'Attribute';
+        if (method_exists($this, $mutator)) {
+            $value = $this->$mutator($value);
+        }
+
         // Apply reverse cast if defined
         if (isset(static::CASTS[$key]) && $value !== null) {
             $value = $this->uncastAttribute($key, $value);
@@ -746,14 +915,81 @@ abstract class Model
     }
 
     /**
-     * Fill multiple attributes
+     * Fill multiple attributes with mass assignment protection.
+     *
+     * Only fills attributes that are mass assignable based on
+     * FILLABLE (whitelist) or GUARDED (blacklist) constants.
+     *
+     * @param array $attributes Attributes to fill
+     * @return static
      */
     public function fill(array $attributes): static
+    {
+        foreach ($attributes as $key => $value) {
+            if ($this->isFillable($key)) {
+                $this->setAttribute($key, $value);
+            }
+        }
+        return $this;
+    }
+
+    /**
+     * Fill attributes without mass assignment protection.
+     *
+     * Use this when you need to bypass fillable/guarded checks,
+     * such as when hydrating from database.
+     *
+     * @param array $attributes Attributes to fill
+     * @return static
+     */
+    public function forceFill(array $attributes): static
     {
         foreach ($attributes as $key => $value) {
             $this->setAttribute($key, $value);
         }
         return $this;
+    }
+
+    /**
+     * Check if an attribute is mass assignable.
+     *
+     * @param string $key Attribute name
+     * @return bool True if the attribute can be mass assigned
+     */
+    protected function isFillable(string $key): bool
+    {
+        // If FILLABLE is defined (non-empty), use whitelist mode
+        if (!empty(static::FILLABLE)) {
+            return in_array($key, static::FILLABLE, true);
+        }
+
+        // If GUARDED is ['*'], nothing is fillable (default secure)
+        if (static::GUARDED === ['*']) {
+            return true; // For backward compatibility, allow all by default
+        }
+
+        // Otherwise, check if key is NOT in guarded list
+        return !in_array($key, static::GUARDED, true);
+    }
+
+    /**
+     * Get all fillable attributes.
+     *
+     * @return array<string> List of fillable attribute names
+     */
+    public function getFillable(): array
+    {
+        return static::FILLABLE;
+    }
+
+    /**
+     * Get all guarded attributes.
+     *
+     * @return array<string> List of guarded attribute names
+     */
+    public function getGuarded(): array
+    {
+        return static::GUARDED;
     }
 
     /**
@@ -1404,7 +1640,9 @@ abstract class Model
 
             // Add loaded relations
             foreach ($this->relations as $key => $relation) {
-                if (is_array($relation)) {
+                if ($relation instanceof Collection) {
+                    $attributes[$key] = $relation->map(fn($m) => $m->toArray())->toArray();
+                } elseif (is_array($relation)) {
                     $attributes[$key] = array_map(fn($m) => $m->toArray(), $relation);
                 } elseif ($relation instanceof self) {
                     $attributes[$key] = $relation->toArray();
@@ -1445,17 +1683,139 @@ abstract class Model
      */
     protected function fireEvent(string $event): void
     {
-        // Call model method if exists
+        // Call model method if exists (e.g., onCreating, onSaved)
         $method = 'on' . ucfirst($event);
         if (method_exists($this, $method)) {
             $this->$method();
         }
 
-        // Call registered listeners
+        // Call registered observers
+        $observers = self::$observers[static::class] ?? [];
+        foreach ($observers as $observer) {
+            if (method_exists($observer, $event)) {
+                $observer->$event($this);
+            }
+        }
+
+        // Call registered event listeners
         $listeners = self::$eventListeners[static::class][$event] ?? [];
         foreach ($listeners as $listener) {
             $listener($this);
         }
+    }
+
+    // ========== GLOBAL SCOPES ==========
+
+    /** @var array<string, array<string, Closure>> Global scopes per model */
+    private static array $globalScopes = [];
+
+    /**
+     * Add a global scope to the model.
+     *
+     * Global scopes are automatically applied to all queries for this model.
+     * Common uses include filtering by tenant, active status, or access control.
+     *
+     * @param string $name Unique name for the scope
+     * @param Closure $scope Closure that receives a QueryBuilder
+     *
+     * @example
+     * ```php
+     * // Only show active users
+     * User::addGlobalScope('active', fn($q) => $q->where('active', true));
+     *
+     * // Multi-tenancy scope
+     * User::addGlobalScope('tenant', fn($q) => $q->where('tenant_id', $currentTenant));
+     * ```
+     */
+    public static function addGlobalScope(string $name, \Closure $scope): void
+    {
+        self::$globalScopes[static::class][$name] = $scope;
+    }
+
+    /**
+     * Remove a global scope from the model.
+     *
+     * @param string $name Scope name to remove
+     */
+    public static function removeGlobalScope(string $name): void
+    {
+        unset(self::$globalScopes[static::class][$name]);
+    }
+
+    /**
+     * Get all global scopes for this model.
+     *
+     * @return array<string, Closure>
+     */
+    public static function getGlobalScopes(): array
+    {
+        return self::$globalScopes[static::class] ?? [];
+    }
+
+    /**
+     * Clear all global scopes for this model.
+     */
+    public static function clearGlobalScopes(): void
+    {
+        self::$globalScopes[static::class] = [];
+    }
+
+    // ========== MODEL OBSERVERS ==========
+
+    /** @var array<string, array<object>> Registered observers per model */
+    private static array $observers = [];
+
+    /**
+     * Register an observer for this model.
+     *
+     * Observers group event handling methods in a single class.
+     * The observer should have methods named after lifecycle events:
+     * creating, created, updating, updated, saving, saved, deleting, deleted,
+     * restoring, restored, forceDeleting, forceDeleted.
+     *
+     * @param string|object $observer Observer class name or instance
+     *
+     * @example
+     * ```php
+     * class UserObserver {
+     *     public function creating(User $user): void {
+     *         $user->uuid = Uuid::generate();
+     *     }
+     *
+     *     public function saved(User $user): void {
+     *         Cache::forget("user:{$user->id}");
+     *     }
+     * }
+     *
+     * User::observe(UserObserver::class);
+     * // or
+     * User::observe(new UserObserver());
+     * ```
+     */
+    public static function observe(string|object $observer): void
+    {
+        if (is_string($observer)) {
+            $observer = new $observer();
+        }
+        self::$observers[static::class][] = $observer;
+    }
+
+    /**
+     * Get all observers for this model.
+     *
+     * @return array<object>
+     */
+    public static function getObservers(): array
+    {
+        return self::$observers[static::class] ?? [];
+    }
+
+    /**
+     * Clear all observers for this model.
+     */
+    public static function clearObservers(): void
+    {
+        self::$observers[static::class] = [];
     }
 
     // ========== CONNECTION MANAGEMENT ==========
@@ -1872,6 +2232,15 @@ class QueryBuilder
     /** @var array<array> HAVING clause definitions */
     private array $having = [];
 
+    /** @var array<array> JOIN clause definitions */
+    private array $joins = [];
+
+    /** @var array<array> UNION query definitions */
+    private array $unions = [];
+
+    /** @var string|null Row locking clause */
+    private ?string $lock = null;
+
     /** @var bool Include soft-deleted records */
     private bool $withTrashed = false;
 
@@ -1881,6 +2250,15 @@ class QueryBuilder
     /** @var array<string> Relationships to eager load */
     private array $eagerLoad = [];
 
+    /** @var array<string> Global scopes to exclude from this query */
+    private array $removedScopes = [];
+
+    /** @var bool Whether to apply global scopes */
+    private bool $applyGlobalScopes = true;
+
+    /** @var bool Whether global scopes have already been applied */
+    private bool $globalScopesApplied = false;
+
     /**
      * Create a new query builder for the given model.
      *
@@ -1889,6 +2267,118 @@ class QueryBuilder
     public function __construct(string $model)
     {
         $this->model = $model;
+    }
+
+    /**
+     * Remove a specific global scope from this query.
+     *
+     * @param string $scope Name of the global scope to remove
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Query without the 'active' scope
+     * User::query()->withoutGlobalScope('active')->get();
+     * ```
+     */
+    public function withoutGlobalScope(string $scope): static
+    {
+        $this->removedScopes[] = $scope;
+        return $this;
+    }
+
+    /**
+     * Remove multiple global scopes from this query.
+     *
+     * @param array<string>|null $scopes Scope names to remove, or null for all
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Remove specific scopes
+     * User::query()->withoutGlobalScopes(['active', 'tenant'])->get();
+     *
+     * // Remove all global scopes
+     * User::query()->withoutGlobalScopes()->get();
+     * ```
+     */
+    public function withoutGlobalScopes(?array $scopes = null): static
+    {
+        if ($scopes === null) {
+            $this->applyGlobalScopes = false;
+        } else {
+            $this->removedScopes = array_merge($this->removedScopes, $scopes);
+        }
+        return $this;
+    }
+
+    /**
+     * Apply global scopes to this query.
+     */
+    private function applyGlobalScopesToQuery(): void
+    {
+        if ($this->globalScopesApplied || !$this->applyGlobalScopes) {
+            return;
+        }
+
+        $this->globalScopesApplied = true;
+
+        $model = $this->model;
+        $scopes = $model::getGlobalScopes();
+
+        foreach ($scopes as $name => $scope) {
+            if (!in_array($name, $this->removedScopes, true)) {
+                $scope($this);
+            }
+        }
+    }
+
+    /**
+     * Handle dynamic method calls for local scopes.
+     *
+     * Local scopes are methods on the model prefixed with 'scope'.
+     * For example, calling `->active()` on query will call `scopeActive()` on model.
+     *
+     * @param string $method Method name
+     * @param array $args Method arguments
+     * @return mixed
+     *
+     * @throws \BadMethodCallException If method doesn't exist
+     *
+     * @example
+     * ```php
+     * // In User model:
+     * public function scopeActive(QueryBuilder $query): QueryBuilder
+     * {
+     *     return $query->where('active', true);
+     * }
+     *
+     * public function scopeOfRole(QueryBuilder $query, string $role): QueryBuilder
+     * {
+     *     return $query->where('role', $role);
+     * }
+     *
+     * // Usage:
+     * User::query()->active()->ofRole('admin')->get();
+     * ```
+     */
+    public function __call(string $method, array $args): mixed
+    {
+        // Check for scope method on model (e.g., scopeActive for ->active())
+        $scopeMethod = 'scope' . ucfirst($method);
+
+        if (method_exists($this->model, $scopeMethod)) {
+            // Create model instance to call scope
+            $modelInstance = new $this->model();
+            $result = $modelInstance->$scopeMethod($this, ...$args);
+
+            // Scopes should return the query builder
+            return $result instanceof static ? $result : $this;
+        }
+
+        throw new \BadMethodCallException(
+            sprintf('Method %s::%s does not exist.', static::class, $method)
+        );
     }
 
     // ========== WHERE CLAUSES ==========
@@ -2068,6 +2558,381 @@ class QueryBuilder
         return $this;
     }
 
+    // ========== SUBQUERIES ==========
+
+    /**
+     * Add a WHERE EXISTS clause.
+     *
+     * @param Closure|QueryBuilder $query Subquery or closure that receives a QueryBuilder
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Find users who have posts
+     * User::query()
+     *     ->whereExists(fn($q) => $q->from('posts')->whereColumn('posts.user_id', 'users.id'))
+     *     ->get();
+     * ```
+     */
+    public function whereExists(\Closure|QueryBuilder $query): static
+    {
+        return $this->addExistsClause($query, 'AND', false);
+    }
+
+    /**
+     * Add an OR WHERE EXISTS clause.
+     */
+    public function orWhereExists(\Closure|QueryBuilder $query): static
+    {
+        return $this->addExistsClause($query, 'OR', false);
+    }
+
+    /**
+     * Add a WHERE NOT EXISTS clause.
+     *
+     * @param Closure|QueryBuilder $query Subquery or closure that receives a QueryBuilder
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Find users who have no posts
+     * User::query()
+     *     ->whereNotExists(fn($q) => $q->from('posts')->whereColumn('posts.user_id', 'users.id'))
+     *     ->get();
+     * ```
+     */
+    public function whereNotExists(\Closure|QueryBuilder $query): static
+    {
+        return $this->addExistsClause($query, 'AND', true);
+    }
+
+    /**
+     * Add an OR WHERE NOT EXISTS clause.
+     */
+    public function orWhereNotExists(\Closure|QueryBuilder $query): static
+    {
+        return $this->addExistsClause($query, 'OR', true);
+    }
+
+    /**
+     * Add EXISTS clause helper.
+     */
+    private function addExistsClause(\Closure|QueryBuilder $query, string $boolean, bool $not): static
+    {
+        if ($query instanceof \Closure) {
+            $subQuery = new QueryBuilder($this->model);
+            $query($subQuery);
+        } else {
+            $subQuery = $query;
+        }
+
+        $this->wheres[] = [
+            'type' => 'exists',
+            'query' => $subQuery,
+            'not' => $not,
+            'boolean' => $boolean,
+        ];
+        return $this;
+    }
+
+    /**
+     * Add a WHERE IN subquery clause.
+     *
+     * @param string $column Column to compare
+     * @param Closure|QueryBuilder $query Subquery that returns single column values
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Find users whose ID is in the posts table
+     * User::query()
+     *     ->whereInSubquery('id', fn($q) => $q->from('posts')->select('user_id'))
+     *     ->get();
+     * ```
+     */
+    public function whereInSubquery(string $column, \Closure|QueryBuilder $query): static
+    {
+        return $this->addInSubqueryClause($column, $query, 'AND', false);
+    }
+
+    /**
+     * Add an OR WHERE IN subquery clause.
+     */
+    public function orWhereInSubquery(string $column, \Closure|QueryBuilder $query): static
+    {
+        return $this->addInSubqueryClause($column, $query, 'OR', false);
+    }
+
+    /**
+     * Add a WHERE NOT IN subquery clause.
+     */
+    public function whereNotInSubquery(string $column, \Closure|QueryBuilder $query): static
+    {
+        return $this->addInSubqueryClause($column, $query, 'AND', true);
+    }
+
+    /**
+     * Add an OR WHERE NOT IN subquery clause.
+     */
+    public function orWhereNotInSubquery(string $column, \Closure|QueryBuilder $query): static
+    {
+        return $this->addInSubqueryClause($column, $query, 'OR', true);
+    }
+
+    /**
+     * Add IN subquery clause helper.
+     */
+    private function addInSubqueryClause(string $column, \Closure|QueryBuilder $query, string $boolean, bool $not): static
+    {
+        if ($query instanceof \Closure) {
+            $subQuery = new QueryBuilder($this->model);
+            $query($subQuery);
+        } else {
+            $subQuery = $query;
+        }
+
+        $this->wheres[] = [
+            'type' => 'in_subquery',
+            'column' => Model::validateIdentifier($column),
+            'query' => $subQuery,
+            'not' => $not,
+            'boolean' => $boolean,
+        ];
+        return $this;
+    }
+
+    /**
+     * Add a column-to-column comparison in a WHERE clause.
+     *
+     * @param string $first First column
+     * @param string $operator Comparison operator
+     * @param string|null $second Second column (or null if operator is used as second column)
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Find records where updated_at differs from created_at
+     * Post::query()->whereColumn('updated_at', '!=', 'created_at')->get();
+     * ```
+     */
+    public function whereColumn(string $first, string $operator, ?string $second = null): static
+    {
+        if ($second === null) {
+            $second = $operator;
+            $operator = '=';
+        }
+
+        $this->wheres[] = [
+            'type' => 'column',
+            'first' => Model::validateIdentifier($first),
+            'operator' => $operator,
+            'second' => Model::validateIdentifier($second),
+            'boolean' => 'AND',
+        ];
+        return $this;
+    }
+
+    /**
+     * Add an OR column comparison.
+     */
+    public function orWhereColumn(string $first, string $operator, ?string $second = null): static
+    {
+        if ($second === null) {
+            $second = $operator;
+            $operator = '=';
+        }
+
+        $this->wheres[] = [
+            'type' => 'column',
+            'first' => Model::validateIdentifier($first),
+            'operator' => $operator,
+            'second' => Model::validateIdentifier($second),
+            'boolean' => 'OR',
+        ];
+        return $this;
+    }
+
+    /**
+     * Set the FROM table for subqueries.
+     *
+     * @param string $table Table name
+     * @return static
+     */
+    public function from(string $table): static
+    {
+        $this->fromTable = Model::validateIdentifier($table);
+        return $this;
+    }
+
+    /** @var string|null Override table for FROM clause */
+    private ?string $fromTable = null;
+
+    // ========== JOINS ==========
+
+    /**
+     * Add an INNER JOIN clause.
+     *
+     * @param string $table Table to join (can include alias: 'posts AS p')
+     * @param string $first First column for ON clause
+     * @param string $operator Comparison operator
+     * @param string $second Second column for ON clause
+     * @return static
+     *
+     * @example
+     * ```php
+     * User::query()
+     *     ->join('posts', 'users.id', '=', 'posts.user_id')
+     *     ->select('users.*', 'posts.title')
+     *     ->get();
+     * ```
+     */
+    public function join(string $table, string $first, string $operator, string $second): static
+    {
+        return $this->addJoin('INNER', $table, $first, $operator, $second);
+    }
+
+    /**
+     * Add a LEFT JOIN clause.
+     *
+     * @param string $table Table to join
+     * @param string $first First column for ON clause
+     * @param string $operator Comparison operator
+     * @param string $second Second column for ON clause
+     * @return static
+     */
+    public function leftJoin(string $table, string $first, string $operator, string $second): static
+    {
+        return $this->addJoin('LEFT', $table, $first, $operator, $second);
+    }
+
+    /**
+     * Add a RIGHT JOIN clause.
+     *
+     * @param string $table Table to join
+     * @param string $first First column for ON clause
+     * @param string $operator Comparison operator
+     * @param string $second Second column for ON clause
+     * @return static
+     */
+    public function rightJoin(string $table, string $first, string $operator, string $second): static
+    {
+        return $this->addJoin('RIGHT', $table, $first, $operator, $second);
+    }
+
+    /**
+     * Add a CROSS JOIN clause.
+     *
+     * @param string $table Table to cross join
+     * @return static
+     */
+    public function crossJoin(string $table): static
+    {
+        $this->joins[] = [
+            'type' => 'CROSS',
+            'table' => $table,
+            'first' => null,
+            'operator' => null,
+            'second' => null,
+        ];
+        return $this;
+    }
+
+    /**
+     * Add a raw JOIN clause.
+     *
+     * @param string $expression Raw JOIN expression
+     * @param array $bindings Parameter bindings
+     * @return static
+     *
+     * @example
+     * ```php
+     * User::query()
+     *     ->joinRaw('LEFT JOIN posts ON posts.user_id = users.id AND posts.published = ?', [true])
+     *     ->get();
+     * ```
+     */
+    public function joinRaw(string $expression, array $bindings = []): static
+    {
+        $this->joins[] = [
+            'type' => 'raw',
+            'expression' => $expression,
+            'bindings' => $bindings,
+        ];
+        return $this;
+    }
+
+    /**
+     * Add a JOIN clause to the query.
+     */
+    private function addJoin(string $type, string $table, string $first, string $operator, string $second): static
+    {
+        $this->joins[] = [
+            'type' => $type,
+            'table' => $table,
+            'first' => $first,
+            'operator' => Model::validateOperator($operator),
+            'second' => $second,
+        ];
+        return $this;
+    }
+
+    /**
+     * Compile JOIN clauses.
+     * @return array{0: string, 1: array}
+     */
+    private function compileJoins(): array
+    {
+        if (empty($this->joins)) {
+            return ['', []];
+        }
+
+        $sql = [];
+        $bindings = [];
+
+        foreach ($this->joins as $join) {
+            if ($join['type'] === 'raw') {
+                $sql[] = $join['expression'];
+                $bindings = array_merge($bindings, $join['bindings']);
+                continue;
+            }
+
+            // Parse table with optional alias (e.g., 'posts AS p' or 'posts p')
+            $tableParts = preg_split('/\s+(?:AS\s+)?/i', $join['table'], 2);
+            $tableName = Model::validateIdentifier(trim($tableParts[0]));
+            $tableAlias = isset($tableParts[1]) ? Model::validateIdentifier(trim($tableParts[1])) : null;
+
+            $quotedTable = Model::quoteIdentifier($tableName);
+            if ($tableAlias) {
+                $quotedTable .= ' AS ' . Model::quoteIdentifier($tableAlias);
+            }
+
+            if ($join['type'] === 'CROSS') {
+                $sql[] = "CROSS JOIN $quotedTable";
+            } else {
+                // Parse column references (e.g., 'users.id' or 'id')
+                $first = $this->quoteColumnReference($join['first']);
+                $second = $this->quoteColumnReference($join['second']);
+
+                $sql[] = "{$join['type']} JOIN $quotedTable ON $first {$join['operator']} $second";
+            }
+        }
+
+        return [implode(' ', $sql), $bindings];
+    }
+
+    /**
+     * Quote a column reference that may include a table prefix.
+     */
+    private function quoteColumnReference(string $column): string
+    {
+        if (str_contains($column, '.')) {
+            $parts = explode('.', $column, 2);
+            return Model::quoteIdentifier(Model::validateIdentifier($parts[0])) . '.'
+                 . Model::quoteIdentifier(Model::validateIdentifier($parts[1]));
+        }
+        return Model::quoteIdentifier(Model::validateIdentifier($column));
+    }
+
     // ========== ORDERING ==========
 
     /**
@@ -2101,6 +2966,235 @@ class QueryBuilder
     public function oldest(string $column = 'created_at'): static
     {
         return $this->orderBy($column, 'ASC');
+    }
+
+    // ========== UNION ==========
+
+    /**
+     * Add a UNION query.
+     *
+     * Combines results from multiple SELECT statements, removing duplicates.
+     *
+     * @param QueryBuilder|Closure $query The query to union
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Get all admins and all editors
+     * User::query()
+     *     ->where('role', 'admin')
+     *     ->union(fn($q) => $q->where('role', 'editor'))
+     *     ->get();
+     * ```
+     */
+    public function union(QueryBuilder|\Closure $query): static
+    {
+        return $this->addUnion($query, false);
+    }
+
+    /**
+     * Add a UNION ALL query.
+     *
+     * Combines results from multiple SELECT statements, keeping all rows including duplicates.
+     *
+     * @param QueryBuilder|Closure $query The query to union
+     * @return static
+     */
+    public function unionAll(QueryBuilder|\Closure $query): static
+    {
+        return $this->addUnion($query, true);
+    }
+
+    /**
+     * Add a union query helper.
+     */
+    private function addUnion(QueryBuilder|\Closure $query, bool $all): static
+    {
+        if ($query instanceof \Closure) {
+            $subQuery = new QueryBuilder($this->model);
+            $query($subQuery);
+        } else {
+            $subQuery = $query;
+        }
+
+        $this->unions[] = [
+            'query' => $subQuery,
+            'all' => $all,
+        ];
+        return $this;
+    }
+
+    // ========== ROW LOCKING ==========
+
+    /**
+     * Lock selected rows for update (pessimistic locking).
+     *
+     * Uses FOR UPDATE to prevent other transactions from modifying selected rows
+     * until the current transaction commits.
+     *
+     * @return static
+     *
+     * @example
+     * ```php
+     * Model::transaction(function() {
+     *     $inventory = Inventory::query()
+     *         ->where('product_id', $productId)
+     *         ->lockForUpdate()
+     *         ->first();
+     *
+     *     if ($inventory->quantity >= $qty) {
+     *         $inventory->quantity -= $qty;
+     *         $inventory->save();
+     *     }
+     * });
+     * ```
+     */
+    public function lockForUpdate(): static
+    {
+        $this->lock = 'FOR UPDATE';
+        return $this;
+    }
+
+    /**
+     * Lock selected rows with a shared lock.
+     *
+     * Allows other transactions to read but not modify selected rows
+     * until the current transaction commits.
+     *
+     * @return static
+     */
+    public function sharedLock(): static
+    {
+        $this->lock = 'FOR SHARE';
+        return $this;
+    }
+
+    /**
+     * Set a custom lock clause.
+     *
+     * @param string $lock Lock clause (e.g., 'FOR UPDATE NOWAIT')
+     * @return static
+     */
+    public function lock(string $lock): static
+    {
+        $this->lock = $lock;
+        return $this;
+    }
+
+    // ========== GROUP BY ==========
+
+    /**
+     * Add GROUP BY clause.
+     *
+     * @param string|array ...$columns Columns to group by
+     * @return static
+     *
+     * @example
+     * ```php
+     * // Single column
+     * User::query()->groupBy('status')->get();
+     *
+     * // Multiple columns
+     * Post::query()->groupBy('user_id', 'category_id')->get();
+     * ```
+     */
+    public function groupBy(string|array ...$columns): static
+    {
+        foreach ($columns as $col) {
+            if (is_array($col)) {
+                foreach ($col as $c) {
+                    $this->groupBy[] = Model::validateIdentifier($c);
+                }
+            } else {
+                $this->groupBy[] = Model::validateIdentifier($col);
+            }
+        }
+        return $this;
+    }
+
+    // ========== HAVING ==========
+
+    /**
+     * Add a HAVING clause (used with GROUP BY).
+     *
+     * @param string $column Column or aggregate expression
+     * @param mixed $operator Comparison operator or value
+     * @param mixed $value Value to compare (if operator provided)
+     * @return static
+     *
+     * @example
+     * ```php
+     * Post::query()
+     *     ->select('user_id', 'COUNT(*) as post_count')
+     *     ->groupBy('user_id')
+     *     ->having('post_count', '>', 5)
+     *     ->get();
+     * ```
+     */
+    public function having(string $column, mixed $operator = null, mixed $value = null): static
+    {
+        // Two arguments: having('column', 'value') means =
+        if ($value === null && $operator !== null) {
+            $value = $operator;
+            $operator = '=';
+        }
+
+        $this->having[] = [
+            'type' => 'basic',
+            'column' => $column, // Allow aggregate expressions like COUNT(*)
+            'operator' => Model::validateOperator($operator),
+            'value' => $value,
+            'boolean' => 'AND',
+        ];
+
+        return $this;
+    }
+
+    /**
+     * Add an OR HAVING clause.
+     */
+    public function orHaving(string $column, mixed $operator = null, mixed $value = null): static
+    {
+        if ($value === null && $operator !== null) {
+            $value = $operator;
+            $operator = '=';
+        }
+
+        $this->having[] = [
+            'type' => 'basic',
+            'column' => $column,
+            'operator' => Model::validateOperator($operator),
+            'value' => $value,
+            'boolean' => 'OR',
+        ];
+
+        return $this;
+    }
+
+    /**
+     * Add a raw HAVING clause.
+     *
+     * @param string $sql Raw SQL for HAVING clause
+     * @param array $bindings Parameter bindings
+     * @return static
+     *
+     * @example
+     * ```php
+     * Post::query()
+     *     ->groupBy('user_id')
+     *     ->havingRaw('COUNT(*) > ?', [5])
+     *     ->get();
+     * ```
+     */
+    public function havingRaw(string $sql, array $bindings = []): static
+    {
+        $this->having[] = [
+            'type' => 'raw',
+            'sql' => $sql,
+            'bindings' => $bindings,
+            'boolean' => 'AND',
+        ];
+        return $this;
     }
 
     // ========== LIMIT & OFFSET ==========
@@ -2157,6 +3251,74 @@ class QueryBuilder
         return $this;
     }
 
+    /**
+     * Add columns to the SELECT clause without replacing existing columns.
+     *
+     * @param string|array ...$columns Columns to add
+     * @return static
+     */
+    public function addSelect(string|array ...$columns): static
+    {
+        foreach ($columns as $col) {
+            if (is_array($col)) {
+                $this->columns = array_merge($this->columns, $col);
+            } else {
+                $this->columns[] = $col;
+            }
+        }
+        return $this;
+    }
+
+    /**
+     * Add a subquery as a column.
+     *
+     * @param Closure|QueryBuilder $query The subquery
+     * @param string $alias Column alias
+     * @return static
+     *
+     * @example
+     * ```php
+     * User::query()
+     *     ->addSelect('*')
+     *     ->selectSub(
+     *         fn($q) => $q->from('posts')->selectRaw('COUNT(*)')->whereColumn('posts.user_id', 'users.id'),
+     *         'posts_count'
+     *     )
+     *     ->get();
+     * ```
+     */
+    public function selectSub(\Closure|QueryBuilder $query, string $alias): static
+    {
+        if ($query instanceof \Closure) {
+            $subQuery = new QueryBuilder($this->model);
+            $query($subQuery);
+        } else {
+            $subQuery = $query;
+        }
+
+        [$sql, $bindings] = $subQuery->toSql();
+        $this->columns[] = "($sql) AS " . Model::quoteIdentifier($alias);
+        $this->selectBindings = array_merge($this->selectBindings, $bindings);
+        return $this;
+    }
+
+    /**
+     * Add a raw expression to the SELECT clause.
+     *
+     * @param string $expression Raw SQL expression
+     * @param array $bindings Parameter bindings
+     * @return static
+     */
+    public function selectRaw(string $expression, array $bindings = []): static
+    {
+        $this->columns[] = $expression;
+        $this->selectBindings = array_merge($this->selectBindings, $bindings);
+        return $this;
+    }
+
+    /** @var array Parameter bindings for SELECT subqueries */
+    private array $selectBindings = [];
+
     // ========== SOFT DELETES ==========
 
     /**
@@ -2198,10 +3360,14 @@ class QueryBuilder
     // ========== EXECUTION ==========
 
     /**
-     * Execute query and return models
+     * Execute query and return models as a Collection
+     *
+     * @return Collection<Model>
      */
-    public function get(): array
+    public function get(): Collection
     {
+        $this->applyGlobalScopesToQuery();
+
         [$sql, $bindings] = $this->toSql();
 
         $model = $this->model;
@@ -2214,7 +3380,7 @@ class QueryBuilder
             $this->loadRelations($models);
         }
 
-        return $models;
+        return new Collection($models);
     }
 
     /**
@@ -2224,7 +3390,7 @@ class QueryBuilder
     {
         $this->limit(1);
         $results = $this->get();
-        return $results[0] ?? null;
+        return $results->first();
     }
 
     /**
@@ -2313,6 +3479,8 @@ class QueryBuilder
      */
     private function aggregate(string $function, string $column): mixed
     {
+        $this->applyGlobalScopesToQuery();
+
         $model = $this->model;
         $col = $column === '*' ? '*' : $model::quoteIdentifier(Model::validateIdentifier($column));
 
@@ -2332,6 +3500,8 @@ class QueryBuilder
      */
     public function pluck(string $column, ?string $key = null): array
     {
+        $this->applyGlobalScopesToQuery();
+
         $columns = [$column];
         if ($key !== null) {
             $columns[] = $key;
@@ -2372,6 +3542,96 @@ class QueryBuilder
     }
 
     /**
+     * Paginate results using cursor-based pagination.
+     *
+     * Cursor pagination is more efficient than offset pagination for large datasets
+     * because it doesn't require counting or skipping rows. It works by using a
+     * column value (typically the ID) to determine the starting point.
+     *
+     * @param int $perPage Number of items per page
+     * @param string $cursorColumn Column to use for cursor (must be unique and sortable)
+     * @param string|null $cursor The cursor value (typically base64-encoded last value)
+     * @param string $direction 'asc' or 'desc'
+     * @return array{data: Collection, next_cursor: ?string, prev_cursor: ?string, has_more: bool}
+     *
+     * @example
+     * ```php
+     * // First page
+     * $page1 = User::query()->orderBy('id')->cursorPaginate(perPage: 10);
+     *
+     * // Next page using cursor
+     * $page2 = User::query()->orderBy('id')->cursorPaginate(
+     *     perPage: 10,
+     *     cursor: $page1['next_cursor']
+     * );
+     * ```
+     */
+    public function cursorPaginate(
+        int $perPage = 15,
+        string $cursorColumn = 'id',
+        ?string $cursor = null,
+        string $direction = 'asc'
+    ): array {
+        $direction = strtolower($direction);
+        $operator = $direction === 'desc' ? '<' : '>';
+
+        // Decode cursor
+        $cursorValue = null;
+        if ($cursor !== null) {
+            $decoded = base64_decode($cursor, true);
+            if ($decoded !== false) {
+                $cursorValue = json_decode($decoded, true);
+            }
+        }
+
+        // Apply cursor constraint
+        if ($cursorValue !== null) {
+            $this->where($cursorColumn, $operator, $cursorValue);
+        }
+
+        // Fetch one extra to check for more
+        $results = (clone $this)
+            ->orderBy($cursorColumn, $direction)
+            ->limit($perPage + 1)
+            ->get();
+
+        $hasMore = $results->count() > $perPage;
+
+        // Remove the extra item if present
+        if ($hasMore) {
+            $results = $results->take($perPage);
+        }
+
+        // Generate next cursor
+        $nextCursor = null;
+        if ($hasMore && $results->isNotEmpty()) {
+            $lastItem = $results->last();
+            $lastValue = $lastItem?->getAttribute($cursorColumn);
+            if ($lastValue !== null) {
+                $nextCursor = base64_encode(json_encode($lastValue));
+            }
+        }
+
+        // Generate previous cursor (first item's value)
+        $prevCursor = null;
+        if ($cursorValue !== null && $results->isNotEmpty()) {
+            $firstItem = $results->first();
+            $firstValue = $firstItem?->getAttribute($cursorColumn);
+            if ($firstValue !== null) {
+                $prevCursor = base64_encode(json_encode($firstValue));
+            }
+        }
+
+        return [
+            'data' => $results,
+            'next_cursor' => $nextCursor,
+            'prev_cursor' => $prevCursor,
+            'has_more' => $hasMore,
+            'per_page' => $perPage,
+        ];
+    }
+
+    /**
      * Process results in chunks
      */
     public function chunk(int $size, callable $callback): bool
@@ -2402,6 +3662,8 @@ class QueryBuilder
      */
     public function update(array $values): int
     {
+        $this->applyGlobalScopesToQuery();
+
         $model = $this->model;
         $table = $model::getTable();
 
@@ -2434,6 +3696,8 @@ class QueryBuilder
      */
     public function delete(): int
     {
+        $this->applyGlobalScopesToQuery();
+
         $model = $this->model;
 
         // Soft delete
@@ -2495,8 +3759,11 @@ class QueryBuilder
     public function toSql(): array
     {
         $model = $this->model;
-        $table = $model::getTable();
+        $table = $this->fromTable ?? $model::getTable();
         $bindings = [];
+
+        // Add select bindings first (for subqueries in SELECT)
+        $bindings = array_merge($bindings, $this->selectBindings);
 
         // SELECT
         $columns = $this->columns === ['*']
@@ -2513,6 +3780,13 @@ class QueryBuilder
 
         $sql = "SELECT $columns FROM " . $model::quoteIdentifier($table);
 
+        // JOINS
+        [$joinSql, $joinBindings] = $this->compileJoins();
+        if ($joinSql) {
+            $sql .= ' ' . $joinSql;
+            $bindings = array_merge($bindings, $joinBindings);
+        }
+
         // Handle soft deletes
         if ($model::SOFT_DELETES) {
             if ($this->onlyTrashed) {
@@ -2527,6 +3801,22 @@ class QueryBuilder
         if ($whereSql) {
             $sql .= " WHERE $whereSql";
             $bindings = array_merge($bindings, $whereBindings);
+        }
+
+        // GROUP BY
+        if (!empty($this->groupBy)) {
+            $groups = array_map(
+                fn($c) => $model::quoteIdentifier($c),
+                $this->groupBy
+            );
+            $sql .= ' GROUP BY ' . implode(', ', $groups);
+        }
+
+        // HAVING
+        [$havingSql, $havingBindings] = $this->compileHaving();
+        if ($havingSql) {
+            $sql .= " HAVING $havingSql";
+            $bindings = array_merge($bindings, $havingBindings);
         }
 
         // ORDER BY
@@ -2546,6 +3836,19 @@ class QueryBuilder
         // OFFSET
         if ($this->offsetValue !== null) {
             $sql .= " OFFSET {$this->offsetValue}";
+        }
+
+        // UNION
+        foreach ($this->unions as $union) {
+            $type = $union['all'] ? 'UNION ALL' : 'UNION';
+            [$unionSql, $unionBindings] = $union['query']->toSql();
+            $sql .= " $type $unionSql";
+            $bindings = array_merge($bindings, $unionBindings);
+        }
+
+        // ROW LOCKING
+        if ($this->lock !== null) {
+            $sql .= ' ' . $this->lock;
         }
 
         return [$sql, $bindings];
@@ -2614,6 +3917,63 @@ class QueryBuilder
                         $bindings = array_merge($bindings, $nestedBindings);
                     }
                     break;
+
+                case 'exists':
+                    [$subSql, $subBindings] = $where['query']->toSql();
+                    $not = $where['not'] ? 'NOT ' : '';
+                    $sql[] = "{$prefix}{$not}EXISTS ($subSql)";
+                    $bindings = array_merge($bindings, $subBindings);
+                    break;
+
+                case 'in_subquery':
+                    [$subSql, $subBindings] = $where['query']->toSql();
+                    $col = $model::quoteIdentifier($where['column']);
+                    $not = $where['not'] ? 'NOT ' : '';
+                    $sql[] = "$prefix$col {$not}IN ($subSql)";
+                    $bindings = array_merge($bindings, $subBindings);
+                    break;
+
+                case 'column':
+                    $first = $this->quoteColumnReference($where['first']);
+                    $second = $this->quoteColumnReference($where['second']);
+                    $sql[] = "$prefix$first {$where['operator']} $second";
+                    break;
+            }
+        }
+
+        return [implode('', $sql), $bindings];
+    }
+
+    /**
+     * Compile HAVING clauses
+     * @return array{0: string, 1: array}
+     */
+    private function compileHaving(): array
+    {
+        if (empty($this->having)) {
+            return ['', []];
+        }
+
+        $sql = [];
+        $bindings = [];
+
+        foreach ($this->having as $i => $having) {
+            $prefix = $i === 0 ? '' : ' ' . $having['boolean'] . ' ';
+
+            switch ($having['type']) {
+                case 'basic':
+                    // Allow aggregate expressions, only quote if it looks like a simple column
+                    $col = preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $having['column'])
+                        ? Model::quoteIdentifier($having['column'])
+                        : $having['column'];
+                    $sql[] = "$prefix$col {$having['operator']} ?";
+                    $bindings[] = $having['value'];
+                    break;
+
+                case 'raw':
+                    $sql[] = $prefix . $having['sql'];
+                    $bindings = array_merge($bindings, $having['bindings']);
+                    break;
             }
         }
 
@@ -2663,7 +4023,9 @@ class QueryBuilder
             $nested = [];
             foreach ($models as $model) {
                 $related = $model->$relation;
-                if (is_array($related)) {
+                if ($related instanceof Collection) {
+                    $nested = array_merge($nested, $related->all());
+                } elseif (is_array($related)) {
                     $nested = array_merge($nested, $related);
                 } elseif ($related !== null) {
                     $nested[] = $related;
@@ -2703,6 +4065,877 @@ class QueryBuilder
     {
         echo $this->toRawSql() . "\n";
         exit(1);
+    }
+}
+
+// ============================================================================
+// COLLECTION
+// ============================================================================
+
+/**
+ * Fluent wrapper for arrays of models with transformation and aggregation methods.
+ *
+ * Collection provides a powerful API for working with arrays of data,
+ * including filtering, mapping, reducing, and aggregation operations.
+ * It implements common interfaces for seamless integration with PHP.
+ *
+ * @template TKey of array-key
+ * @template TValue
+ * @implements \IteratorAggregate<TKey, TValue>
+ * @implements \ArrayAccess<TKey, TValue>
+ *
+ * @example
+ * ```php
+ * // QueryBuilder returns Collection
+ * $users = User::where('active', true)->get();
+ *
+ * // Fluent operations
+ * $names = $users->pluck('name');
+ * $admins = $users->where('is_admin', true);
+ * $grouped = $users->groupBy('department');
+ * ```
+ */
+class Collection implements \IteratorAggregate, \ArrayAccess, \Countable, \JsonSerializable
+{
+    /** @var array<TKey, TValue> */
+    protected array $items;
+
+    /**
+     * Create a new collection instance.
+     *
+     * @param array<TKey, TValue> $items Items to wrap
+     */
+    public function __construct(array $items = [])
+    {
+        $this->items = $items;
+    }
+
+    /**
+     * Create a new collection.
+     *
+     * @param array $items Items to wrap
+     * @return static
+     */
+    public static function make(array $items = []): static
+    {
+        return new static($items);
+    }
+
+    /**
+     * Wrap a value in a collection if not already one.
+     *
+     * @param mixed $value Value to wrap
+     * @return static
+     */
+    public static function wrap(mixed $value): static
+    {
+        if ($value instanceof self) {
+            return new static($value->all());
+        }
+        return new static(is_array($value) ? $value : [$value]);
+    }
+
+    // ========== BASIC ACCESSORS ==========
+
+    /**
+     * Get all items as array.
+     *
+     * @return array<TKey, TValue>
+     */
+    public function all(): array
+    {
+        return $this->items;
+    }
+
+    /**
+     * Get number of items.
+     */
+    public function count(): int
+    {
+        return count($this->items);
+    }
+
+    /**
+     * Check if collection is empty.
+     */
+    public function isEmpty(): bool
+    {
+        return empty($this->items);
+    }
+
+    /**
+     * Check if collection is not empty.
+     */
+    public function isNotEmpty(): bool
+    {
+        return !$this->isEmpty();
+    }
+
+    // ========== TRANSFORMATION ==========
+
+    /**
+     * Apply a callback to each item and return new collection.
+     *
+     * @param callable $callback Function receiving (value, key)
+     * @return static
+     */
+    public function map(callable $callback): static
+    {
+        $keys = array_keys($this->items);
+        $values = array_map($callback, $this->items, $keys);
+        return new static(array_combine($keys, $values));
+    }
+
+    /**
+     * Filter items using a callback.
+     *
+     * @param callable|null $callback Filter function (value, key) => bool
+     * @return static
+     */
+    public function filter(?callable $callback = null): static
+    {
+        if ($callback === null) {
+            return new static(array_filter($this->items));
+        }
+        return new static(array_filter($this->items, $callback, ARRAY_FILTER_USE_BOTH));
+    }
+
+    /**
+     * Reject items matching callback (inverse of filter).
+     *
+     * @param callable $callback Function (value, key) => bool
+     * @return static
+     */
+    public function reject(callable $callback): static
+    {
+        return $this->filter(fn($v, $k) => !$callback($v, $k));
+    }
+
+    /**
+     * Reduce collection to a single value.
+     *
+     * @param callable $callback Function (carry, item) => mixed
+     * @param mixed $initial Initial value
+     * @return mixed
+     */
+    public function reduce(callable $callback, mixed $initial = null): mixed
+    {
+        return array_reduce($this->items, $callback, $initial);
+    }
+
+    /**
+     * Execute callback for each item.
+     *
+     * @param callable $callback Function (value, key) => void|false
+     * @return static
+     */
+    public function each(callable $callback): static
+    {
+        foreach ($this->items as $key => $item) {
+            if ($callback($item, $key) === false) {
+                break;
+            }
+        }
+        return $this;
+    }
+
+    /**
+     * Split collection into chunks.
+     *
+     * @param int $size Chunk size
+     * @return static Collection of collections
+     */
+    public function chunk(int $size): static
+    {
+        $chunks = array_chunk($this->items, $size, true);
+        return new static(array_map(fn($chunk) => new static($chunk), $chunks));
+    }
+
+    /**
+     * Flatten a multi-dimensional collection.
+     *
+     * @param int $depth Depth to flatten (INF for all)
+     * @return static
+     */
+    public function flatten(int $depth = INF): static
+    {
+        $result = [];
+        foreach ($this->items as $item) {
+            if (!is_array($item) && !$item instanceof self) {
+                $result[] = $item;
+            } elseif ($depth === 1) {
+                $values = $item instanceof self ? $item->all() : $item;
+                $result = array_merge($result, array_values($values));
+            } else {
+                $values = $item instanceof self ? $item->all() : $item;
+                $result = array_merge($result, (new static($values))->flatten($depth - 1)->all());
+            }
+        }
+        return new static($result);
+    }
+
+    // ========== ACCESS ==========
+
+    /**
+     * Get first item, optionally matching callback.
+     *
+     * @param callable|null $callback Filter function
+     * @param mixed $default Default if not found
+     * @return mixed
+     */
+    public function first(?callable $callback = null, mixed $default = null): mixed
+    {
+        if ($callback === null) {
+            return $this->items[array_key_first($this->items)] ?? $default;
+        }
+        foreach ($this->items as $key => $value) {
+            if ($callback($value, $key)) {
+                return $value;
+            }
+        }
+        return $default;
+    }
+
+    /**
+     * Get last item, optionally matching callback.
+     *
+     * @param callable|null $callback Filter function
+     * @param mixed $default Default if not found
+     * @return mixed
+     */
+    public function last(?callable $callback = null, mixed $default = null): mixed
+    {
+        if ($callback === null) {
+            return $this->items[array_key_last($this->items)] ?? $default;
+        }
+        $result = $default;
+        foreach ($this->items as $key => $value) {
+            if ($callback($value, $key)) {
+                $result = $value;
+            }
+        }
+        return $result;
+    }
+
+    /**
+     * Get item by key.
+     *
+     * @param int|string $key Item key
+     * @param mixed $default Default if not found
+     * @return mixed
+     */
+    public function get(int|string $key, mixed $default = null): mixed
+    {
+        return $this->items[$key] ?? $default;
+    }
+
+    /**
+     * Extract column values from items.
+     *
+     * @param string $key Column to extract
+     * @param string|null $keyBy Optional column to use as keys
+     * @return static
+     */
+    public function pluck(string $key, ?string $keyBy = null): static
+    {
+        $results = [];
+        foreach ($this->items as $item) {
+            $value = is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null);
+            if ($keyBy !== null) {
+                $keyValue = is_array($item) ? ($item[$keyBy] ?? null) : ($item->$keyBy ?? null);
+                $results[$keyValue] = $value;
+            } else {
+                $results[] = $value;
+            }
+        }
+        return new static($results);
+    }
+
+    /**
+     * Group items by a key or callback.
+     *
+     * @param string|callable $key Grouping key or callback
+     * @return static Collection of collections
+     */
+    public function groupBy(string|callable $key): static
+    {
+        $results = [];
+        foreach ($this->items as $item) {
+            $groupKey = is_callable($key)
+                ? $key($item)
+                : (is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null));
+            $results[$groupKey][] = $item;
+        }
+        return new static(array_map(fn($group) => new static($group), $results));
+    }
+
+    /**
+     * Key items by a column or callback.
+     *
+     * @param string|callable $key Column name or callback
+     * @return static
+     */
+    public function keyBy(string|callable $key): static
+    {
+        $results = [];
+        foreach ($this->items as $item) {
+            $keyValue = is_callable($key)
+                ? $key($item)
+                : (is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null));
+            $results[$keyValue] = $item;
+        }
+        return new static($results);
+    }
+
+    // ========== SORTING ==========
+
+    /**
+     * Sort items.
+     *
+     * @param callable|null $callback Comparison function
+     * @return static
+     */
+    public function sort(?callable $callback = null): static
+    {
+        $items = $this->items;
+        $callback ? uasort($items, $callback) : asort($items);
+        return new static($items);
+    }
+
+    /**
+     * Sort items by key or callback.
+     *
+     * @param string|callable $key Sort key or callback
+     * @param bool $descending Sort descending
+     * @return static
+     */
+    public function sortBy(string|callable $key, bool $descending = false): static
+    {
+        $items = $this->items;
+        uasort($items, function ($a, $b) use ($key, $descending) {
+            $aValue = is_callable($key) ? $key($a) : (is_array($a) ? ($a[$key] ?? null) : ($a->$key ?? null));
+            $bValue = is_callable($key) ? $key($b) : (is_array($b) ? ($b[$key] ?? null) : ($b->$key ?? null));
+            $result = $aValue <=> $bValue;
+            return $descending ? -$result : $result;
+        });
+        return new static($items);
+    }
+
+    /**
+     * Sort items by key descending.
+     *
+     * @param string|callable $key Sort key
+     * @return static
+     */
+    public function sortByDesc(string|callable $key): static
+    {
+        return $this->sortBy($key, true);
+    }
+
+    /**
+     * Reverse item order.
+     *
+     * @return static
+     */
+    public function reverse(): static
+    {
+        return new static(array_reverse($this->items, true));
+    }
+
+    // ========== AGGREGATES ==========
+
+    /**
+     * Sum of items or column.
+     *
+     * @param string|callable|null $key Column or callback
+     * @return int|float
+     */
+    public function sum(string|callable|null $key = null): int|float
+    {
+        if ($key === null) {
+            return array_sum($this->items);
+        }
+        return $this->pluck(is_string($key) ? $key : '')->reduce(
+            fn($carry, $item) => $carry + (is_callable($key) ? $key($item) : $item),
+            0
+        );
+    }
+
+    /**
+     * Average of items or column.
+     *
+     * @param string|callable|null $key Column or callback
+     * @return int|float|null
+     */
+    public function avg(string|callable|null $key = null): int|float|null
+    {
+        $count = $this->count();
+        return $count > 0 ? $this->sum($key) / $count : null;
+    }
+
+    /**
+     * Minimum value.
+     *
+     * @param string|callable|null $key Column or callback
+     * @return mixed
+     */
+    public function min(string|callable|null $key = null): mixed
+    {
+        $items = $key !== null ? $this->pluck($key)->all() : $this->items;
+        return empty($items) ? null : min($items);
+    }
+
+    /**
+     * Maximum value.
+     *
+     * @param string|callable|null $key Column or callback
+     * @return mixed
+     */
+    public function max(string|callable|null $key = null): mixed
+    {
+        $items = $key !== null ? $this->pluck($key)->all() : $this->items;
+        return empty($items) ? null : max($items);
+    }
+
+    /**
+     * Get median value.
+     *
+     * @param string|null $key Column to get median of
+     * @return int|float|null
+     */
+    public function median(?string $key = null): int|float|null
+    {
+        $values = $key !== null ? $this->pluck($key)->all() : $this->items;
+        $count = count($values);
+        if ($count === 0) {
+            return null;
+        }
+        sort($values);
+        $middle = (int) floor($count / 2);
+        if ($count % 2 === 0) {
+            return ($values[$middle - 1] + $values[$middle]) / 2;
+        }
+        return $values[$middle];
+    }
+
+    // ========== SEARCH & FILTERING ==========
+
+    /**
+     * Check if collection contains a value or matches callback.
+     *
+     * @param mixed $key Value, key, or callback
+     * @param mixed $value Value to compare (if key provided)
+     * @return bool
+     */
+    public function contains(mixed $key, mixed $value = null): bool
+    {
+        if ($value !== null) {
+            return $this->contains(fn($item) =>
+                (is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null)) === $value
+            );
+        }
+        if (is_callable($key)) {
+            foreach ($this->items as $k => $item) {
+                if ($key($item, $k)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return in_array($key, $this->items, true);
+    }
+
+    /**
+     * Filter by key/value comparison.
+     *
+     * @param string $key Column to compare
+     * @param mixed $operator Operator or value
+     * @param mixed $value Value (if operator provided)
+     * @return static
+     */
+    public function where(string $key, mixed $operator = null, mixed $value = null): static
+    {
+        if ($value === null && $operator !== null) {
+            $value = $operator;
+            $operator = '=';
+        }
+        return $this->filter(function ($item) use ($key, $operator, $value) {
+            $itemValue = is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null);
+            return match ($operator) {
+                '=', '==' => $itemValue == $value,
+                '===' => $itemValue === $value,
+                '!=', '<>' => $itemValue != $value,
+                '!==' => $itemValue !== $value,
+                '>' => $itemValue > $value,
+                '<' => $itemValue < $value,
+                '>=' => $itemValue >= $value,
+                '<=' => $itemValue <= $value,
+                default => false,
+            };
+        });
+    }
+
+    /**
+     * Filter by value being in array.
+     *
+     * @param string $key Column to check
+     * @param array $values Allowed values
+     * @return static
+     */
+    public function whereIn(string $key, array $values): static
+    {
+        return $this->filter(fn($item) =>
+            in_array(is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null), $values, true)
+        );
+    }
+
+    /**
+     * Filter by value not being in array.
+     *
+     * @param string $key Column to check
+     * @param array $values Disallowed values
+     * @return static
+     */
+    public function whereNotIn(string $key, array $values): static
+    {
+        return $this->filter(fn($item) =>
+            !in_array(is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null), $values, true)
+        );
+    }
+
+    /**
+     * Filter by value being null.
+     *
+     * @param string $key Column to check
+     * @return static
+     */
+    public function whereNull(string $key): static
+    {
+        return $this->where($key, '===', null);
+    }
+
+    /**
+     * Filter by value not being null.
+     *
+     * @param string $key Column to check
+     * @return static
+     */
+    public function whereNotNull(string $key): static
+    {
+        return $this->where($key, '!==', null);
+    }
+
+    // ========== SET OPERATIONS ==========
+
+    /**
+     * Get unique items.
+     *
+     * @param string|null $key Column to check for uniqueness
+     * @return static
+     */
+    public function unique(?string $key = null): static
+    {
+        if ($key === null) {
+            return new static(array_unique($this->items, SORT_REGULAR));
+        }
+        $exists = [];
+        return $this->filter(function ($item) use ($key, &$exists) {
+            $value = is_array($item) ? ($item[$key] ?? null) : ($item->$key ?? null);
+            if (in_array($value, $exists, true)) {
+                return false;
+            }
+            $exists[] = $value;
+            return true;
+        });
+    }
+
+    /**
+     * Get values only (reset keys).
+     *
+     * @return static
+     */
+    public function values(): static
+    {
+        return new static(array_values($this->items));
+    }
+
+    /**
+     * Get keys only.
+     *
+     * @return static
+     */
+    public function keys(): static
+    {
+        return new static(array_keys($this->items));
+    }
+
+    /**
+     * Merge with another array or collection.
+     *
+     * @param iterable $items Items to merge
+     * @return static
+     */
+    public function merge(iterable $items): static
+    {
+        return new static(array_merge(
+            $this->items,
+            $items instanceof self ? $items->all() : (is_array($items) ? $items : iterator_to_array($items))
+        ));
+    }
+
+    /**
+     * Combine collection values with given keys.
+     *
+     * @param iterable $keys Keys to use
+     * @return static
+     */
+    public function combine(iterable $keys): static
+    {
+        $keys = $keys instanceof self ? $keys->all() : (is_array($keys) ? $keys : iterator_to_array($keys));
+        return new static(array_combine($keys, $this->items));
+    }
+
+    /**
+     * Get difference with another array.
+     *
+     * @param iterable $items Items to diff against
+     * @return static
+     */
+    public function diff(iterable $items): static
+    {
+        $items = $items instanceof self ? $items->all() : (is_array($items) ? $items : iterator_to_array($items));
+        return new static(array_diff($this->items, $items));
+    }
+
+    /**
+     * Get intersection with another array.
+     *
+     * @param iterable $items Items to intersect with
+     * @return static
+     */
+    public function intersect(iterable $items): static
+    {
+        $items = $items instanceof self ? $items->all() : (is_array($items) ? $items : iterator_to_array($items));
+        return new static(array_intersect($this->items, $items));
+    }
+
+    // ========== SLICE OPERATIONS ==========
+
+    /**
+     * Take first n items.
+     *
+     * @param int $limit Number of items
+     * @return static
+     */
+    public function take(int $limit): static
+    {
+        if ($limit < 0) {
+            return new static(array_slice($this->items, $limit, abs($limit), true));
+        }
+        return new static(array_slice($this->items, 0, $limit, true));
+    }
+
+    /**
+     * Skip first n items.
+     *
+     * @param int $count Number to skip
+     * @return static
+     */
+    public function skip(int $count): static
+    {
+        return new static(array_slice($this->items, $count, null, true));
+    }
+
+    /**
+     * Get slice of collection.
+     *
+     * @param int $offset Start position
+     * @param int|null $length Number of items
+     * @return static
+     */
+    public function slice(int $offset, ?int $length = null): static
+    {
+        return new static(array_slice($this->items, $offset, $length, true));
+    }
+
+    /**
+     * Paginate the collection.
+     *
+     * @param int $perPage Items per page
+     * @param int $page Page number (1-based)
+     * @return static
+     */
+    public function forPage(int $page, int $perPage): static
+    {
+        return $this->slice(($page - 1) * $perPage, $perPage);
+    }
+
+    // ========== INTERFACE IMPLEMENTATIONS ==========
+
+    /**
+     * Get iterator for foreach.
+     *
+     * @return \Traversable
+     */
+    public function getIterator(): \Traversable
+    {
+        return new \ArrayIterator($this->items);
+    }
+
+    /**
+     * Check if offset exists.
+     */
+    public function offsetExists(mixed $offset): bool
+    {
+        return isset($this->items[$offset]);
+    }
+
+    /**
+     * Get item at offset.
+     */
+    public function offsetGet(mixed $offset): mixed
+    {
+        return $this->items[$offset];
+    }
+
+    /**
+     * Set item at offset.
+     */
+    public function offsetSet(mixed $offset, mixed $value): void
+    {
+        if ($offset === null) {
+            $this->items[] = $value;
+        } else {
+            $this->items[$offset] = $value;
+        }
+    }
+
+    /**
+     * Remove item at offset.
+     */
+    public function offsetUnset(mixed $offset): void
+    {
+        unset($this->items[$offset]);
+    }
+
+    /**
+     * Convert to JSON-serializable array.
+     *
+     * @return array
+     */
+    public function jsonSerialize(): array
+    {
+        return array_map(
+            fn($item) => $item instanceof \JsonSerializable ? $item->jsonSerialize() : $item,
+            $this->items
+        );
+    }
+
+    /**
+     * Convert to array (with nested model conversion).
+     *
+     * @return array
+     */
+    public function toArray(): array
+    {
+        return array_map(
+            fn($item) => $item instanceof Model ? $item->toArray() : $item,
+            $this->items
+        );
+    }
+
+    /**
+     * Convert to JSON string.
+     *
+     * @param int $options JSON encoding options
+     * @return string
+     */
+    public function toJson(int $options = 0): string
+    {
+        return json_encode($this->jsonSerialize(), $options);
+    }
+
+    /**
+     * Convert to string (JSON).
+     *
+     * @return string
+     */
+    public function __toString(): string
+    {
+        return $this->toJson();
+    }
+
+    /**
+     * Add an item to the collection.
+     *
+     * @param mixed $item Item to add
+     * @return static
+     */
+    public function push(mixed ...$items): static
+    {
+        foreach ($items as $item) {
+            $this->items[] = $item;
+        }
+        return $this;
+    }
+
+    /**
+     * Remove and return last item.
+     *
+     * @return mixed
+     */
+    public function pop(): mixed
+    {
+        return array_pop($this->items);
+    }
+
+    /**
+     * Remove and return first item.
+     *
+     * @return mixed
+     */
+    public function shift(): mixed
+    {
+        return array_shift($this->items);
+    }
+
+    /**
+     * Add item to beginning.
+     *
+     * @param mixed $item Item to prepend
+     * @return static
+     */
+    public function prepend(mixed $item): static
+    {
+        array_unshift($this->items, $item);
+        return $this;
+    }
+
+    /**
+     * Put an item at a key.
+     *
+     * @param int|string $key Key
+     * @param mixed $value Value
+     * @return static
+     */
+    public function put(int|string $key, mixed $value): static
+    {
+        $this->items[$key] = $value;
+        return $this;
+    }
+
+    /**
+     * Forget an item by key.
+     *
+     * @param int|string|array $keys Keys to forget
+     * @return static
+     */
+    public function forget(int|string|array $keys): static
+    {
+        foreach ((array) $keys as $key) {
+            unset($this->items[$key]);
+        }
+        return $this;
     }
 }
 
@@ -2774,18 +5007,18 @@ abstract class Relation
     /**
      * Get results for eager loading.
      *
-     * @return array<Model> Array of related models
+     * @return Collection|array<Model> Collection or array of related models
      */
-    abstract public function getEagerResults(): array;
+    abstract public function getEagerResults(): Collection|array;
 
     /**
      * Match eager loaded results to their parent models.
      *
      * @param array<Model> $models Parent models
-     * @param array<Model> $results Related models
+     * @param Collection|array<Model> $results Related models
      * @param string $relation The relationship name
      */
-    abstract public function match(array $models, array $results, string $relation): void;
+    abstract public function match(array $models, Collection|array $results, string $relation): void;
 
     /**
      * Get a new query builder for the related model.
@@ -2849,15 +5082,15 @@ class HasOne extends Relation
         ));
     }
 
-    public function getEagerResults(): array
+    public function getEagerResults(): Collection
     {
         if (empty($this->eagerKeys)) {
-            return [];
+            return new Collection([]);
         }
         return $this->newQuery()->whereIn($this->foreignKey, $this->eagerKeys)->get();
     }
 
-    public function match(array $models, array $results, string $relation): void
+    public function match(array $models, Collection|array $results, string $relation): void
     {
         $dictionary = [];
         foreach ($results as $result) {
@@ -2894,11 +5127,11 @@ class HasOne extends Relation
  */
 class HasMany extends Relation
 {
-    public function getResults(): array
+    public function getResults(): Collection
     {
         $value = $this->parent->getAttribute($this->localKey);
         if ($value === null) {
-            return [];
+            return new Collection([]);
         }
         return $this->newQuery()->where($this->foreignKey, $value)->get();
     }
@@ -2910,15 +5143,15 @@ class HasMany extends Relation
         ));
     }
 
-    public function getEagerResults(): array
+    public function getEagerResults(): Collection
     {
         if (empty($this->eagerKeys)) {
-            return [];
+            return new Collection([]);
         }
         return $this->newQuery()->whereIn($this->foreignKey, $this->eagerKeys)->get();
     }
 
-    public function match(array $models, array $results, string $relation): void
+    public function match(array $models, Collection|array $results, string $relation): void
     {
         $dictionary = [];
         foreach ($results as $result) {
@@ -2928,7 +5161,7 @@ class HasMany extends Relation
 
         foreach ($models as $model) {
             $key = $model->getAttribute($this->localKey);
-            $model->setRelation($relation, $dictionary[$key] ?? []);
+            $model->setRelation($relation, new Collection($dictionary[$key] ?? []));
         }
     }
 }
@@ -2971,15 +5204,15 @@ class BelongsTo extends Relation
         ));
     }
 
-    public function getEagerResults(): array
+    public function getEagerResults(): Collection
     {
         if (empty($this->eagerKeys)) {
-            return [];
+            return new Collection([]);
         }
         return $this->newQuery()->whereIn($this->localKey, $this->eagerKeys)->get();
     }
 
-    public function match(array $models, array $results, string $relation): void
+    public function match(array $models, Collection|array $results, string $relation): void
     {
         $dictionary = [];
         foreach ($results as $result) {
@@ -3084,11 +5317,11 @@ class BelongsToMany extends Relation
         return $this;
     }
 
-    public function getResults(): array
+    public function getResults(): Collection
     {
         $parentKey = $this->parent->getKey();
         if ($parentKey === null) {
-            return [];
+            return new Collection([]);
         }
 
         $related = $this->related;
@@ -3111,7 +5344,7 @@ class BelongsToMany extends Relation
              . "WHERE " . Model::quoteIdentifier($this->pivotTable) . "." . Model::quoteIdentifier($this->foreignPivotKey) . " = ?";
 
         $results = $related::executeQuery($sql, [$parentKey]);
-        return array_map(fn($row) => $related::hydrate($row), $results);
+        return new Collection(array_map(fn($row) => $related::hydrate($row), $results));
     }
 
     public function addEagerConstraints(array $models): void
@@ -3121,10 +5354,10 @@ class BelongsToMany extends Relation
         ));
     }
 
-    public function getEagerResults(): array
+    public function getEagerResults(): Collection
     {
         if (empty($this->eagerKeys)) {
-            return [];
+            return new Collection([]);
         }
 
         $related = $this->related;
@@ -3142,10 +5375,10 @@ class BelongsToMany extends Relation
              . "WHERE " . Model::quoteIdentifier($this->pivotTable) . "." . Model::quoteIdentifier($this->foreignPivotKey) . " IN ($placeholders)";
 
         $results = $related::executeQuery($sql, $this->eagerKeys);
-        return array_map(fn($row) => $related::hydrate($row), $results);
+        return new Collection(array_map(fn($row) => $related::hydrate($row), $results));
     }
 
-    public function match(array $models, array $results, string $relation): void
+    public function match(array $models, Collection|array $results, string $relation): void
     {
         $dictionary = [];
         foreach ($results as $result) {
@@ -3155,7 +5388,7 @@ class BelongsToMany extends Relation
 
         foreach ($models as $model) {
             $key = $model->getKey();
-            $model->setRelation($relation, $dictionary[$key] ?? []);
+            $model->setRelation($relation, new Collection($dictionary[$key] ?? []));
         }
     }
 

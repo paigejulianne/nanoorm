@@ -15,17 +15,18 @@ class RelationshipTest extends NanoORMTestCase
         $posts = $user->posts;
 
         $this->assertCount(2, $posts);
-        $this->assertContains('Post 1', array_map(fn($p) => $p->title, $posts));
-        $this->assertContains('Post 2', array_map(fn($p) => $p->title, $posts));
+        $titles = $posts->pluck('title')->toArray();
+        $this->assertContains('Post 1', $titles);
+        $this->assertContains('Post 2', $titles);
     }
 
-    public function testHasManyReturnsEmptyArrayWhenNone(): void
+    public function testHasManyReturnsEmptyCollectionWhenNone(): void
     {
         $user = $this->createUser();
 
         $posts = $user->posts;
 
-        $this->assertIsArray($posts);
+        $this->assertInstanceOf(\NanoORM\Collection::class, $posts);
         $this->assertEmpty($posts);
     }
 
@@ -108,7 +109,7 @@ class RelationshipTest extends NanoORMTestCase
         $roles = $loadedUser->roles;
 
         $this->assertCount(2, $roles);
-        $roleNames = array_map(fn($r) => $r->name, $roles);
+        $roleNames = $roles->pluck('name')->toArray();
         $this->assertContains('admin', $roleNames);
         $this->assertContains('editor', $roleNames);
     }
@@ -125,7 +126,7 @@ class RelationshipTest extends NanoORMTestCase
         $roles = $loadedUser->roles;
 
         $this->assertCount(1, $roles);
-        $this->assertEquals('admin', $roles[0]->name);
+        $this->assertEquals('admin', $roles->first()->name);
     }
 
     public function testBelongsToManyAttachMultiple(): void
@@ -191,7 +192,7 @@ class RelationshipTest extends NanoORMTestCase
 
         Model::clearIdentityMap();
         $loadedUser = User::find($user->getKey());
-        $roleNames = array_map(fn($r) => $r->name, $loadedUser->roles);
+        $roleNames = $loadedUser->roles->pluck('name')->toArray();
 
         $this->assertCount(2, $roleNames);
         $this->assertContains('editor', $roleNames);
